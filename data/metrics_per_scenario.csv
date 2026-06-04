@@ -1,0 +1,6 @@
+scenariusz,próbek,Warstwa 1 (progi),Warstwa 2 (statystyki),Warstwa 3 (Isolation Forest)
+battery_drain,25,1/25 (4%),1/25 (4%),0/25 (0%)
+control_freeze,10,0/10 (0%),5/10 (50%),0/10 (0%)
+engine_failure,12,0/12 (0%),2/12 (17%),11/12 (92%)
+gps_spoofing,20,0/20 (0%),1/20 (5%),8/20 (40%)
+sensor_jamming,12,12/12 (100%),6/12 (50%),11/12 (92%)
