@@ -1,4 +1,0 @@
-warstwa,TP,FP,FN,TN,precision,recall,F1
-Warstwa 1 (progi),13,163,66,358,0.074,0.165,0.102
-Warstwa 2 (statystyki),15,3,64,518,0.833,0.19,0.309
-Warstwa 3 (Isolation Forest),30,32,49,489,0.484,0.38,0.426

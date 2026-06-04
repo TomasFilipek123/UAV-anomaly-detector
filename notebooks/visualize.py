@@ -1,124 +1,152 @@
 """
-Wizualizacja telemetrii z zaznaczonymi alertami i ground truth.
+Wizualizacja telemetrii dla pojedynczego lotu (case_id).
 
-Pokazuje na czterech panelach (altitude, speed, heading, battery):
-  - przebieg parametru w czasie
-  - czerwone pasy w tle: ground truth (anomalie wstrzyknięte)
-  - pomarańczowe kropki: alerty warstwy 1 (progi)
-  - niebieskie kropki: alerty warstwy 2 (nagłe zmiany)
+Rysuje 5 paneli:
+  - altitude  (m)
+  - speed     (m/s)
+  - heading   (deg)
+  - lat / lon (trajektoria 2D - mini-mapa w osobnym panelu)
+  - lat / lon vs czas (alternatywa)
+
+Plus zaznacza:
+  - pasy tla = ground truth (label == 1) z etykieta tamper_type
+  - kropki   = alerty z kazdej warstwy detekcji
 """
 
 from pathlib import Path
-import sys
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import pandas as pd
 
-# Dodajemy katalog projektu (rodzic notebooks/) do sys.path
-# żeby działały importy `from detection.rules import ...`
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from detection.rules import detect_threshold_violations
-from detection.statistical import detect_sudden_changes
-from detection.ml import detect_ml_anomalies
 
 
-def plot_telemetry(df: pd.DataFrame, output_path: str = None):
-    """Rysuje 4-panelowy wykres telemetrii z alertami wszystkich 3 warstw."""
-    # Aplikujemy wszystkie 3 warstwy detekcji
-    df = detect_threshold_violations(df)
-    df = detect_sudden_changes(df)
-    df = detect_ml_anomalies(df)
+def _anomaly_segments(case_df: pd.DataFrame) -> list[tuple[float, float, str]]:
+    """Zwraca ciagle segmenty (t_start, t_end, tamper_type)."""
+    segs = []
+    in_seg = False
+    seg_start = None
+    seg_type = None
+    for _, row in case_df.iterrows():
+        if row["label"] == 1 and not in_seg:
+            seg_start = row["t_rel"]
+            seg_type = row["tamper_type"]
+            in_seg = True
+        elif (row["label"] == 0 or row["tamper_type"] != seg_type) and in_seg:
+            segs.append((seg_start, row["t_rel"], seg_type))
+            if row["label"] == 1:
+                seg_start = row["t_rel"]
+                seg_type = row["tamper_type"]
+                in_seg = True
+            else:
+                in_seg = False
+    if in_seg:
+        segs.append((seg_start, case_df["t_rel"].iloc[-1], seg_type))
+    return segs
 
-    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+
+def plot_case(
+    df: pd.DataFrame,
+    case_id,
+    output_path: str = None,
+) -> plt.Figure:
+    """
+    Rysuje telemetrie dla jednego case_id. Wymaga w df kolumn:
+      timestamp, t_rel, latitude, longitude, altitude, speed, heading,
+      label, tamper_type,
+      oraz opcjonalnie alert_threshold, alert_change, alert_ml
+    """
+    case_df = df[df["case_id"] == case_id].copy().sort_values("t_rel").reset_index(drop=True)
+    if len(case_df) == 0:
+        raise ValueError(f"Brak danych dla case_id={case_id}")
+
+    fig = plt.figure(figsize=(15, 10))
+    gs = fig.add_gridspec(4, 2, width_ratios=[3, 1], hspace=0.35, wspace=0.2)
+
+    ax_alt = fig.add_subplot(gs[0, 0])
+    ax_spd = fig.add_subplot(gs[1, 0], sharex=ax_alt)
+    ax_hdg = fig.add_subplot(gs[2, 0], sharex=ax_alt)
+    ax_lat = fig.add_subplot(gs[3, 0], sharex=ax_alt)
+    ax_map = fig.add_subplot(gs[:, 1])
+
     fig.suptitle(
-        "Telemetria drona — detekcja anomalii\n"
-        "(warstwa 1: progi  •  warstwa 2: nagłe zmiany / freeze  •  warstwa 3: Isolation Forest)",
-        fontsize=12, fontweight="bold",
+        f"Telemetria drona - case_id = {case_id}  "
+        f"(profile = {case_df['profile'].iloc[0]})",
+        fontsize=13, fontweight="bold",
     )
 
-    params = [
-        ("altitude_m", "Wysokość [m]", "tab:blue"),
-        ("speed_mps", "Prędkość [m/s]", "tab:green"),
-        ("heading_deg", "Kurs [°]", "tab:purple"),
-        ("battery_pct", "Bateria [%]", "tab:orange"),
+    panels = [
+        (ax_alt, "altitude",  "Wysokosc [m]",  "tab:blue"),
+        (ax_spd, "speed",     "Predkosc [m/s]", "tab:green"),
+        (ax_hdg, "heading",   "Kurs [deg]",    "tab:purple"),
+        (ax_lat, "latitude",  "Lat [deg]",     "tab:brown"),
     ]
 
-    # Identyfikujemy ciągłe segmenty anomalii (do narysowania pasów tła)
-    anomaly_segments = []
-    if "is_anomaly" in df.columns:
-        in_anomaly = False
-        seg_start = None
-        seg_type = None
-        for i, row in df.iterrows():
-            if row["is_anomaly"] and not in_anomaly:
-                seg_start = row["timestamp"]
-                seg_type = row["anomaly_type"]
-                in_anomaly = True
-            elif (not row["is_anomaly"] or row["anomaly_type"] != seg_type) and in_anomaly:
-                anomaly_segments.append((seg_start, row["timestamp"], seg_type))
-                in_anomaly = row["is_anomaly"]
-                if in_anomaly:
-                    seg_start = row["timestamp"]
-                    seg_type = row["anomaly_type"]
-        if in_anomaly:
-            anomaly_segments.append((seg_start, df["timestamp"].iloc[-1], seg_type))
+    segs = _anomaly_segments(case_df)
 
-    for ax, (col, label, color) in zip(axes, params):
-        # Linia podstawowa
-        ax.plot(df["timestamp"], df[col], color=color, linewidth=1.0, label=label)
+    has = {col: col in case_df.columns for col in ["alert_threshold", "alert_change", "alert_ml"]}
 
-        # Pasy tła = ground truth
-        for start, end, atype in anomaly_segments:
+    for ax, col, label, color in panels:
+        ax.plot(case_df["t_rel"], case_df[col], color=color, linewidth=1.0)
+        for start, end, atype in segs:
             ax.axvspan(start, end, alpha=0.18, color="red")
-            # Etykieta typu anomalii nad pierwszym panelem
-            if col == "altitude_m":
+            if ax is ax_alt:
                 ax.text((start + end) / 2, ax.get_ylim()[1] * 0.95,
-                        atype, ha="center", fontsize=8,
-                        color="darkred", fontweight="bold")
+                        atype, ha="center", fontsize=7,
+                        color="darkred", fontweight="bold", rotation=15)
 
-        # Alerty warstwy 1 (progi)
-        l1 = df[df["alert_threshold"]]
-        if len(l1) > 0:
-            ax.scatter(l1["timestamp"], l1[col],
-                       color="orange", s=15, zorder=5, marker="o",
-                       edgecolors="darkorange", linewidth=0.5)
-
-        # Alerty warstwy 2 (nagłe zmiany / freeze)
-        l2 = df[df["alert_change"]]
-        if len(l2) > 0:
-            ax.scatter(l2["timestamp"], l2[col],
-                       color="blue", s=30, zorder=6, marker="x", linewidth=1.5)
-
-        # Alerty warstwy 3 (Isolation Forest)
-        l3 = df[df["alert_ml"]]
-        if len(l3) > 0:
-            ax.scatter(l3["timestamp"], l3[col],
-                       color="green", s=40, zorder=7, marker="^",
-                       edgecolors="darkgreen", linewidth=0.5, alpha=0.7)
-
+        for alert_col, c, marker, s in [
+            ("alert_threshold", "orange", "o", 15),
+            ("alert_change",    "blue",   "x", 30),
+            ("alert_ml",        "green",  "^", 40),
+        ]:
+            if has[alert_col]:
+                sub = case_df[case_df[alert_col]]
+                if len(sub) > 0:
+                    ax.scatter(sub["t_rel"], sub[col], color=c, s=s, zorder=5, marker=marker,
+                               alpha=0.7, linewidths=0.5)
         ax.set_ylabel(label)
         ax.grid(True, alpha=0.3)
 
-    axes[-1].set_xlabel("Czas [s]")
+    ax_lat.set_xlabel("Czas od startu [s]")
+
+    # Mini-mapa trajektorii
+    ax_map.plot(case_df["longitude"], case_df["latitude"],
+                color="gray", linewidth=0.8, alpha=0.6, label="trasa")
+    anom = case_df[case_df["label"] == 1]
+    if len(anom) > 0:
+        ax_map.scatter(anom["longitude"], anom["latitude"],
+                       color="red", s=8, alpha=0.6, label="anomalia (GT)")
+    ax_map.set_xlabel("Longitude")
+    ax_map.set_ylabel("Latitude")
+    ax_map.set_title("Trajektoria GPS")
+    ax_map.legend(loc="best", fontsize=8)
+    ax_map.grid(True, alpha=0.3)
+    ax_map.set_aspect("equal", adjustable="datalim")
 
     # Legenda zbiorcza
-    legend_elements = [
+    legend_elems = [
         mpatches.Patch(color="red", alpha=0.18, label="Anomalia (ground truth)"),
-        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="orange",
-                   markersize=8, label="Warstwa 1: próg fizyczny"),
-        plt.Line2D([0], [0], marker="x", color="blue",
-                   markersize=8, label="Warstwa 2: nagła zmiana / freeze", linewidth=0),
-        plt.Line2D([0], [0], marker="^", color="w", markerfacecolor="green",
-                   markersize=9, label="Warstwa 3: Isolation Forest"),
     ]
-    fig.legend(handles=legend_elements, loc="lower center", ncol=4,
-               bbox_to_anchor=(0.5, -0.01), fontsize=10)
+    if has["alert_threshold"]:
+        legend_elems.append(plt.Line2D([0], [0], marker="o", color="w",
+                                        markerfacecolor="orange", markersize=8,
+                                        label="W1: prog"))
+    if has["alert_change"]:
+        legend_elems.append(plt.Line2D([0], [0], marker="x", color="blue",
+                                        markersize=8, label="W2: nagla zmiana",
+                                        linewidth=0))
+    if has["alert_ml"]:
+        legend_elems.append(plt.Line2D([0], [0], marker="^", color="w",
+                                        markerfacecolor="green", markersize=9,
+                                        label="W3: ML"))
+    fig.legend(handles=legend_elems, loc="lower center", ncol=4,
+               bbox_to_anchor=(0.5, -0.01), fontsize=9)
 
     plt.tight_layout()
-    plt.subplots_adjust(bottom=0.08)
+    plt.subplots_adjust(top=0.93, bottom=0.06)
 
     if output_path:
         plt.savefig(output_path, dpi=120, bbox_inches="tight")
@@ -126,8 +154,22 @@ def plot_telemetry(df: pd.DataFrame, output_path: str = None):
     return fig
 
 
+def pick_case_with_anomalies(df: pd.DataFrame, min_anomalies: int = 50) -> int:
+    """Wybiera pierwszy case_id z odpowiednia liczba anomalii (do demo)."""
+    counts = df[df["label"] == 1].groupby("case_id").size()
+    candidates = counts[counts >= min_anomalies]
+    if len(candidates) == 0:
+        return int(df["case_id"].iloc[0])
+    return int(candidates.index[0])
+
+
 if __name__ == "__main__":
-    csv_path = PROJECT_ROOT / "data" / "flight_with_anomalies.csv"
-    png_path = PROJECT_ROOT / "data" / "telemetry_plot.png"
-    df = pd.read_csv(csv_path)
-    plot_telemetry(df, str(png_path))
+    import sys
+    sys.path.insert(0, str(PROJECT_ROOT))
+    from data.loader import load_dataset
+
+    df = load_dataset()
+    case = pick_case_with_anomalies(df)
+    print(f"Wybrany case_id: {case}")
+    png_path = PROJECT_ROOT / "data" / f"case_{case}_plot.png"
+    plot_case(df, case, str(png_path))

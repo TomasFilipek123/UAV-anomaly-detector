@@ -1,192 +1,300 @@
 """
-Warstwa 3: detekcja anomalii przez Isolation Forest na cechach okienkowych.
+Warstwa 3: detekcja anomalii przez modele ML na cechach okienkowych.
 
-Idea:
-  - Dla każdej próbki obliczamy cechy opisujące okno N sekund przed nią:
-    mean, std, range, slope dla altitude/speed/battery
-    + statystyki cyklicznej różnicy kursu.
-  - Isolation Forest uczy się jak wyglądają "normalne" okna na czystym locie,
-    a następnie zwraca anomaly score dla każdego okna w locie testowym.
+Wspierane algorytmy:
+  unsupervised : Isolation Forest, One-Class SVM, Local Outlier Factor
+  supervised   : Random Forest, XGBoost
 
-Ta warstwa łapie anomalie kontekstowe, które warstwa 2 omija — np. zacięcie
-sterów (control_freeze), bo zamrożone parametry powodują std=0 w oknie,
-co w normalnym locie się nie zdarza.
+Cechy okienkowe (15+) liczone niezaleznie per case_id:
+  altitude  : mean, std, range, slope
+  speed     : mean, std, range, slope
+  heading   : diff_mean, diff_std, diff_abs_max  (na cyklicznych roznicach)
+  gps_step  : mean, std, max                     (haversine miedzy probkami)
+  speed_vs_gps : roznica miedzy speed sensora a predkoscia liczona z GPS
+  sample_var_score : suma std-ow (sygnal "zamrozenia")
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from pathlib import Path
+import pickle
+import warnings
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.svm import OneClassSVM
 
 
-# Domyślna konfiguracja
-DEFAULT_CONFIG = {
-    "window_s": 8,                # długość okna cech
-    "n_estimators": 150,          # liczba drzew w lesie
-    "random_state": 42,           # ziarno dla powtarzalności
-    "n_train_flights": 3,         # ile czystych lotów użyć do treningu
-    "threshold_percentile": 2.0,  # próg = ten percentyl scores z czystego lotu
-    # ^ 2.0 oznacza: na czystym treningu chcemy ~2% false positive rate.
-    #   Każda próbka testowa ze scorem poniżej tego progu = anomalia.
-}
-
+# --- Cechy okienkowe ------------------------------------------------------
 
 def _circular_diff(series: pd.Series) -> pd.Series:
-    """Pochodna kursu z poprawnym wrap-around (359 -> 1 = 2°, nie -358°)."""
     raw = series.diff()
     return ((raw + 180) % 360) - 180
 
 
-def compute_features(df: pd.DataFrame, window: int = 8) -> pd.DataFrame:
-    """
-    Wylicza cechy okienkowe dla każdej próbki w DataFrame.
+def _haversine_step(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    R = 6_371_000.0
+    lat1 = np.radians(lat[:-1])
+    lat2 = np.radians(lat[1:])
+    dlat = lat2 - lat1
+    dlon = np.radians(lon[1:] - lon[:-1])
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    d = 2 * R * np.arcsin(np.sqrt(a))
+    return np.concatenate([[np.nan], d])
 
-    Zwraca DataFrame z 14 cechami:
-      - alt_mean, alt_std, alt_range, alt_slope
-      - spd_mean, spd_std, spd_range, spd_slope
-      - bat_mean, bat_slope (bateria jest monotoniczna, std/range bezużyteczne)
-      - hdg_diff_mean, hdg_diff_std, hdg_diff_abs_max
-      - sample_var_score (zsumowane std — wykrywa "zamrożone" okna)
-    """
-    feats = pd.DataFrame(index=df.index)
-    min_p = window // 2  # minimalna liczba próbek na początku serii
 
-    # --- Cechy okienkowe per parametr ---
-    for col, prefix in [
-        ("altitude_m", "alt"),
-        ("speed_mps", "spd"),
-    ]:
-        s = df[col]
+def _features_one_case(case_df: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Liczy cechy okienkowe dla pojedynczego lotu (case_id)."""
+    feats = pd.DataFrame(index=case_df.index)
+    min_p = max(2, window // 2)
+
+    for col, prefix in [("altitude", "alt"), ("speed", "spd")]:
+        s = case_df[col]
         roll = s.rolling(window=window, min_periods=min_p)
         feats[f"{prefix}_mean"] = roll.mean()
         feats[f"{prefix}_std"] = roll.std()
         feats[f"{prefix}_range"] = roll.max() - roll.min()
-        # Slope = liniowy gradient w oknie (proste przybliżenie: (last-first)/window)
         feats[f"{prefix}_slope"] = (s - s.shift(window - 1)) / window
 
-    # Bateria — tylko mean i slope (monotoniczne zmienne, std/range nieinformatywne)
-    bat_roll = df["battery_pct"].rolling(window=window, min_periods=min_p)
-    feats["bat_mean"] = bat_roll.mean()
-    feats["bat_slope"] = (
-        df["battery_pct"] - df["battery_pct"].shift(window - 1)
-    ) / window
-
-    # Kurs — używamy cyklicznych różnic
-    hdg_diff = _circular_diff(df["heading_deg"])
+    hdg_diff = _circular_diff(case_df["heading"])
     feats["hdg_diff_mean"] = hdg_diff.rolling(window=window, min_periods=min_p).mean()
     feats["hdg_diff_std"] = hdg_diff.rolling(window=window, min_periods=min_p).std()
-    feats["hdg_diff_abs_max"] = (
-        hdg_diff.abs().rolling(window=window, min_periods=min_p).max()
-    )
+    feats["hdg_diff_abs_max"] = hdg_diff.abs().rolling(window=window, min_periods=min_p).max()
 
-    # Dodatkowa cecha: zsumowane std — niskie wartości = "zamrożone okno"
+    gps_step = pd.Series(
+        _haversine_step(case_df["latitude"].values, case_df["longitude"].values),
+        index=case_df.index,
+    )
+    feats["gps_step_mean"] = gps_step.rolling(window=window, min_periods=min_p).mean()
+    feats["gps_step_std"] = gps_step.rolling(window=window, min_periods=min_p).std()
+    feats["gps_step_max"] = gps_step.rolling(window=window, min_periods=min_p).max()
+
+    # Roznica miedzy predkoscia sensora a predkoscia z GPS
+    # (zaklada sample rate ~1 Hz - jesli inny, korekta byc moze potrzebna)
+    dt = case_df["timestamp"].diff().replace(0, np.nan)
+    gps_speed = gps_step / dt
+    feats["speed_vs_gps"] = (case_df["speed"] - gps_speed).abs()
+    feats["speed_vs_gps"] = feats["speed_vs_gps"].rolling(window=window, min_periods=min_p).mean()
+
     feats["sample_var_score"] = (
         feats["alt_std"].fillna(0)
         + feats["spd_std"].fillna(0)
         + feats["hdg_diff_std"].fillna(0)
+        + feats["gps_step_std"].fillna(0)
     )
 
-    # Wypełnij NaN-y na początku (przed pełnym oknem) — backfill, potem 0
+    return feats
+
+
+def compute_features(df: pd.DataFrame, window: int = 8) -> pd.DataFrame:
+    """
+    Liczy cechy okienkowe dla calego DataFrame, grupujac per case_id.
+    Wypelnia NaN-y (bfill + 0) na koncu - kazda probka ma kompletny wektor cech.
+    """
+    parts = []
+    for _, case_df in df.groupby("case_id", sort=False):
+        parts.append(_features_one_case(case_df, window))
+    feats = pd.concat(parts).sort_index()
     feats = feats.bfill().fillna(0)
     return feats
 
 
-def train_isolation_forest(
-    df_train: pd.DataFrame,
-    config: dict = None,
-) -> tuple[IsolationForest, float, list]:
+# --- AnomalyDetector ------------------------------------------------------
+
+SUPPORTED_ALGOS = {"isolation_forest", "one_class_svm", "lof", "random_forest", "xgboost"}
+UNSUPERVISED = {"isolation_forest", "one_class_svm", "lof"}
+SUPERVISED = {"random_forest", "xgboost"}
+
+
+@dataclass
+class AnomalyDetector:
     """
-    Trenuje Isolation Forest na czystym locie i wylicza próg z percentyla scores.
+    Jednolity interfejs dla 5 algorytmow detekcji anomalii.
 
-    Zwraca (model, threshold, feature_names).
+    Unsupervised (trenowane na samych label==0):
+      - 'isolation_forest'
+      - 'one_class_svm'
+      - 'lof'        (uwaga: trenuje sie inaczej - novelty=True)
+
+    Supervised (wymagaja kolumny 'label' w treningu):
+      - 'random_forest'
+      - 'xgboost'    (opcjonalny - tylko jesli pakiet zainstalowany)
+
+    Atrybuty po fit:
+      - model         : wytrenowany estymator
+      - threshold     : prog na score (tylko unsupervised)
+      - feature_names : lista cech (kolejnosc istotna dla predict)
     """
-    if config is None:
-        config = DEFAULT_CONFIG
 
-    train_feats = compute_features(df_train, window=config["window_s"])
-    feature_names = list(train_feats.columns)
+    algorithm: str
+    window: int = 8
+    threshold_percentile: float = 2.0
+    params: dict = field(default_factory=dict)
 
-    model = IsolationForest(
-        n_estimators=config["n_estimators"],
-        contamination="auto",  # nie używamy do progowania — robimy to ręcznie
-        random_state=config["random_state"],
-        n_jobs=-1,
-    )
-    model.fit(train_feats.values)
+    model: object = field(default=None, init=False)
+    threshold: float | None = field(default=None, init=False)
+    feature_names: list[str] = field(default_factory=list, init=False)
 
-    # Próg = określony percentyl scores na zbiorze treningowym
-    # (niższy score = bardziej anomalna; bierzemy dolny ogon rozkładu)
-    train_scores = model.score_samples(train_feats.values)
-    threshold = np.percentile(train_scores, config["threshold_percentile"])
+    def __post_init__(self):
+        if self.algorithm not in SUPPORTED_ALGOS:
+            raise ValueError(f"Nieznany algorytm: {self.algorithm}. Dostepne: {SUPPORTED_ALGOS}")
 
-    return model, threshold, feature_names
+    def _build_estimator(self):
+        a = self.algorithm
+        if a == "isolation_forest":
+            return IsolationForest(
+                n_estimators=self.params.get("n_estimators", 150),
+                contamination="auto",
+                random_state=self.params.get("random_state", 42),
+                n_jobs=-1,
+            )
+        if a == "one_class_svm":
+            return OneClassSVM(
+                kernel=self.params.get("kernel", "rbf"),
+                gamma=self.params.get("gamma", "scale"),
+                nu=self.params.get("nu", 0.05),
+            )
+        if a == "lof":
+            return LocalOutlierFactor(
+                n_neighbors=self.params.get("n_neighbors", 20),
+                novelty=True,  # konieczne zeby moc wolac predict na nowych danych
+                n_jobs=-1,
+            )
+        if a == "random_forest":
+            return RandomForestClassifier(
+                n_estimators=self.params.get("n_estimators", 200),
+                max_depth=self.params.get("max_depth", None),
+                class_weight=self.params.get("class_weight", "balanced"),
+                random_state=self.params.get("random_state", 42),
+                n_jobs=-1,
+            )
+        if a == "xgboost":
+            try:
+                from xgboost import XGBClassifier
+            except ImportError as e:
+                raise ImportError(
+                    "Brak pakietu xgboost. Zainstaluj: pip install xgboost"
+                ) from e
+            return XGBClassifier(
+                n_estimators=self.params.get("n_estimators", 200),
+                max_depth=self.params.get("max_depth", 6),
+                learning_rate=self.params.get("learning_rate", 0.1),
+                eval_metric=self.params.get("eval_metric", "logloss"),
+                random_state=self.params.get("random_state", 42),
+                n_jobs=-1,
+            )
+        raise ValueError(self.algorithm)
 
+    def fit(self, df_train: pd.DataFrame) -> "AnomalyDetector":
+        """
+        Trenuje detektor.
+          - unsupervised : filtruje df_train do label==0 i uczy na czystych probkach
+          - supervised   : uczy na calym df_train uzywajac kolumny 'label'
+        """
+        feats = compute_features(df_train, window=self.window)
+        self.feature_names = list(feats.columns)
+        X = feats.values
+
+        self.model = self._build_estimator()
+
+        if self.algorithm in UNSUPERVISED:
+            mask = df_train["label"].values == 0
+            X_train = X[mask]
+            self.model.fit(X_train)
+            # Prog z percentyla scores na czystym zbiorze treningowym
+            scores = self._raw_scores(X_train)
+            self.threshold = float(np.percentile(scores, self.threshold_percentile))
+        else:
+            y = df_train["label"].astype(int).values
+            self.model.fit(X, y)
+
+        return self
+
+    def _raw_scores(self, X: np.ndarray) -> np.ndarray:
+        """
+        Zwraca surowe scores (nizsze = bardziej anomalna) dla unsupervised
+        albo p(label=1) dla supervised.
+        """
+        if self.algorithm == "isolation_forest":
+            return self.model.score_samples(X)
+        if self.algorithm == "one_class_svm":
+            return self.model.score_samples(X)
+        if self.algorithm == "lof":
+            return self.model.score_samples(X)
+        if self.algorithm in SUPERVISED:
+            return self.model.predict_proba(X)[:, 1]
+        raise ValueError(self.algorithm)
+
+    def predict(self, df_test: pd.DataFrame) -> pd.DataFrame:
+        """
+        Zwraca df_test z dodanymi kolumnami:
+          - alert_ml  : bool
+          - ml_score  : float (semantyka zalezna od algorytmu)
+            * unsupervised : nizszy = bardziej anomalna (jak w IsolationForest.score_samples)
+            * supervised   : p(label=1) (wyzszy = bardziej anomalna)
+        """
+        if self.model is None:
+            raise RuntimeError("Wywolaj fit() przed predict()")
+
+        feats = compute_features(df_test, window=self.window)
+        if list(feats.columns) != self.feature_names:
+            warnings.warn("Kolejnosc cech zmieniona - poprawiam.")
+            feats = feats[self.feature_names]
+        X = feats.values
+
+        scores = self._raw_scores(X)
+        if self.algorithm in UNSUPERVISED:
+            alerts = scores < self.threshold
+        else:
+            alerts = scores >= 0.5
+
+        result = df_test.copy()
+        result["alert_ml"] = alerts
+        result["ml_score"] = scores
+        return result
+
+    # --- serializacja ---
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def load(path: str | Path) -> "AnomalyDetector":
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+
+# --- Zachowanie kompatybilnosci z run_all.py ------------------------------
 
 def detect_ml_anomalies(
     df_test: pd.DataFrame,
-    df_train: pd.DataFrame = None,
-    config: dict = None,
+    df_train: pd.DataFrame,
+    algorithm: str = "isolation_forest",
+    **kwargs,
 ) -> pd.DataFrame:
-    """
-    Wykrywa anomalie w df_test używając Isolation Forest wytrenowanego na df_train.
-
-    Jeśli df_train nie podany — generuje N czystych lotów (różne seedy) i łączy
-    je w jeden zbiór treningowy. Większa różnorodność = mniej false positives.
-
-    Zwraca df_test z dodanymi kolumnami:
-      - alert_ml   : bool, czy próbka oznaczona jako anomalia
-      - ml_score   : ciągły anomaly score (niższy = bardziej anomalna)
-    """
-    if config is None:
-        config = DEFAULT_CONFIG
-
-    # Jeśli nie podano zbioru treningowego, generujemy N czystych lotów
-    if df_train is None:
-        import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from data.generate import generate_normal_flight
-
-        duration = int(df_test["timestamp"].max()) + 1
-        train_flights = [
-            generate_normal_flight(duration_s=duration, seed=1000 + i)
-            for i in range(config["n_train_flights"])
-        ]
-        df_train = pd.concat(train_flights, ignore_index=True)
-
-    # Trening
-    model, threshold, _ = train_isolation_forest(df_train, config)
-
-    # Inference: każda próbka ze score poniżej progu = anomalia
-    test_feats = compute_features(df_test, window=config["window_s"])
-    scores = model.score_samples(test_feats.values)
-
-    result = df_test.copy()
-    result["alert_ml"] = scores < threshold
-    result["ml_score"] = scores
-    return result
+    """Trenuje detektor na df_train i zwraca df_test z kolumnami alert_ml/ml_score."""
+    det = AnomalyDetector(algorithm=algorithm, **kwargs).fit(df_train)
+    return det.predict(df_test)
 
 
 if __name__ == "__main__":
-    csv_path = Path(__file__).resolve().parent.parent / "data" / "flight_with_anomalies.csv"
-    df = pd.read_csv(csv_path)
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from data.loader import load_dataset, split_by_replicate
 
-    print("Trenowanie Isolation Forest na czystym locie...")
-    result = detect_ml_anomalies(df)
+    print("Loading dataset...")
+    df = load_dataset()
+    train, test = split_by_replicate(df)
+    print(f"Train: {len(train):,}  Test: {len(test):,}")
 
-    n_alerts = result["alert_ml"].sum()
-    print(f"\nPróbek z alertem ML: {n_alerts}/{len(result)}")
-
-    # Statystyki per typ anomalii
-    print("\nSkuteczność per typ anomalii:")
-    for atype in result["anomaly_type"].unique():
-        if atype == "none":
-            continue
-        subset = result[result["anomaly_type"] == atype]
-        detected = subset["alert_ml"].sum()
-        print(f"  {atype:20s}: wykryto {detected}/{len(subset)} próbek")
-
-    # False positives na "czystych" próbkach
-    clean = result[result["anomaly_type"] == "none"]
-    false_pos = clean["alert_ml"].sum()
-    print(f"\nFałszywe alarmy na czystych próbkach: {false_pos}/{len(clean)}")
+    print("\nIsolation Forest:")
+    det = AnomalyDetector(algorithm="isolation_forest").fit(train)
+    out = det.predict(test)
+    print(f"  alerts: {out['alert_ml'].sum():,}/{len(out):,}")
+    print(pd.crosstab(out["alert_ml"], out["label"]))

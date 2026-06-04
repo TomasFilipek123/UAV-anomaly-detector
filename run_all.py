@@ -1,11 +1,16 @@
 """
-Uruchamia cały pipeline w odpowiedniej kolejności:
-  1. Generuje normalny lot
-  2. Wstrzykuje anomalie
-  3. Tworzy wykres z alertami
+Pelny pipeline na rzeczywistym datasecie Kaggle:
+  1. Wczytuje dataset (data/drone_telemetry_v2.csv)
+  2. Dzieli train/test po replicate
+  3. Aplikuje 3 warstwy detekcji (rules / statistical / ML)
+  4. Ewaluacja: precision/recall/F1, macierze pomylek, krzywe ROC
+  5. Wizualizacja jednego wybranego case_id
 
 Uruchom z katalogu projektu:
-    python run_all.py
+    python run_all.py [algorithm]
+
+Domyslny algorytm warstwy 3 to isolation_forest. Inne opcje:
+    one_class_svm, lof, random_forest, xgboost
 """
 
 from pathlib import Path
@@ -14,98 +19,83 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from data.generate import generate_normal_flight
-from data.inject_anomalies import (
-    inject_gps_spoofing,
-    inject_engine_failure,
-    inject_control_freeze,
-    inject_battery_drain,
-    inject_sensor_jamming,
-)
-from notebooks.visualize import plot_telemetry
+from data.loader import load_dataset, split_by_replicate, summarize
+from detection.rules import detect_threshold_violations
+from detection.statistical import detect_sudden_changes
+from detection.ml import AnomalyDetector
+from evaluation.metrics import run_full_evaluation
+from notebooks.visualize import plot_case, pick_case_with_anomalies
 
 
-def main():
+def main(algorithm: str = "isolation_forest") -> None:
     print("=" * 60)
-    print("KROK 1: Generowanie normalnego lotu")
+    print("KROK 1: Wczytywanie datasetu")
     print("=" * 60)
-    df = generate_normal_flight(duration_s=600, sample_rate_hz=1, seed=42)
-    normal_path = PROJECT_ROOT / "data" / "normal_flight.csv"
-    df.to_csv(normal_path, index=False)
-    print(f"Zapisano: {normal_path}")
-    print(f"Liczba próbek: {len(df)}")
+    df = load_dataset()
+    summarize(df)
 
     print()
     print("=" * 60)
-    print("KROK 2: Wstrzykiwanie anomalii")
+    print("KROK 2: Train/test split (po replicate)")
     print("=" * 60)
-    df = inject_gps_spoofing(df, start_s=180, duration_s=20)
-    df = inject_engine_failure(df, start_s=280, duration_s=12)
-    df = inject_control_freeze(df, start_s=340, duration_s=10)
-    df = inject_battery_drain(df, start_s=400, duration_s=25)
-    df = inject_sensor_jamming(df, start_s=460, duration_s=12)
-    anomaly_path = PROJECT_ROOT / "data" / "flight_with_anomalies.csv"
-    df.to_csv(anomaly_path, index=False)
-    print(f"Zapisano: {anomaly_path}")
-    print(f"Próbek anomalnych: {df['is_anomaly'].sum()}/{len(df)}")
-    print("\nLiczba próbek per typ anomalii:")
-    print(df["anomaly_type"].value_counts())
+    train, test = split_by_replicate(df)
+    print(f"Train (replicate 0,1,2): {len(train):,}")
+    print(f"Test  (replicate 3):     {len(test):,}")
 
     print()
     print("=" * 60)
-    print("KROK 3: Generowanie wykresu z detekcją")
+    print("KROK 3: Warstwa 1 - progi fizyczne")
     print("=" * 60)
-    png_path = PROJECT_ROOT / "data" / "telemetry_plot.png"
-    plot_telemetry(df, str(png_path))
+    test = detect_threshold_violations(test)
+    print(f"Alerty W1: {test['alert_threshold'].sum():,}/{len(test):,}")
 
     print()
     print("=" * 60)
-    print("KROK 4: Podsumowanie skuteczności (3 warstwy)")
+    print("KROK 4: Warstwa 2 - statystyki kroczace")
     print("=" * 60)
-    from detection.rules import detect_threshold_violations
-    from detection.statistical import detect_sudden_changes
-    from detection.ml import detect_ml_anomalies
-
-    df_eval = detect_threshold_violations(df)
-    df_eval = detect_sudden_changes(df_eval)
-    df_eval = detect_ml_anomalies(df_eval)
-
-    # Każdy typ anomalii — ile próbek wykryła każda warstwa
-    print(f"\n{'Scenariusz':<18} {'Próbki':<8} {'W1 (próg)':<10} {'W2 (zmiany)':<12} {'W3 (ML)':<9}")
-    print("-" * 60)
-    for atype in ["engine_failure", "gps_spoofing", "battery_drain",
-                  "control_freeze", "sensor_jamming"]:
-        subset = df_eval[df_eval["anomaly_type"] == atype]
-        if len(subset) == 0:
-            continue
-        n = len(subset)
-        n1 = subset["alert_threshold"].sum()
-        n2 = subset["alert_change"].sum()
-        n3 = subset["alert_ml"].sum()
-        print(f"{atype:<18} {n:<8} {n1}/{n:<8} {n2}/{n:<10} {n3}/{n}")
-
-    clean = df_eval[df_eval["anomaly_type"] == "none"]
-    fp1 = clean["alert_threshold"].sum()
-    fp2 = clean["alert_change"].sum()
-    fp3 = clean["alert_ml"].sum()
-    print(f"\n{'False positives':<18} {len(clean):<8} {fp1}/{len(clean):<8} "
-          f"{fp2}/{len(clean):<10} {fp3}/{len(clean)}")
+    test = detect_sudden_changes(test)
+    print(f"Alerty W2: {test['alert_change'].sum():,}/{len(test):,}")
 
     print()
     print("=" * 60)
-    print("KROK 5: Pełna ewaluacja (precision/recall/F1, ROC, macierze)")
+    print(f"KROK 5: Warstwa 3 - ML ({algorithm})")
     print("=" * 60)
-    from evaluation.metrics import run_full_evaluation
-    run_full_evaluation(df_eval)
+    detector = AnomalyDetector(algorithm=algorithm).fit(train)
+    test = detector.predict(test)
+    print(f"Alerty W3: {test['alert_ml'].sum():,}/{len(test):,}")
+
+    # Zapis modelu
+    models_dir = PROJECT_ROOT / "models"
+    detector.save(models_dir / f"{algorithm}.pkl")
+    print(f"Zapisano model: {models_dir / f'{algorithm}.pkl'}")
+
+    print()
+    print("=" * 60)
+    print("KROK 6: Pelna ewaluacja")
+    print("=" * 60)
+    score_dir = "low" if algorithm in {"isolation_forest", "one_class_svm", "lof"} else "high"
+    run_full_evaluation(
+        test,
+        score_columns={f"W3 ({algorithm})": ("ml_score", score_dir)},
+        output_dir=PROJECT_ROOT / "data",
+    )
+
+    print()
+    print("=" * 60)
+    print("KROK 7: Wizualizacja przykladowego case'a")
+    print("=" * 60)
+    case = pick_case_with_anomalies(test)
+    png_path = PROJECT_ROOT / "data" / f"case_{case}_plot.png"
+    plot_case(test, case, str(png_path))
 
     print()
     print("=" * 60)
     print("GOTOWE")
     print("=" * 60)
-    print(f"Wykres telemetrii:  {png_path}")
-    print(f"Macierze pomyłek:   {PROJECT_ROOT / 'data' / 'confusion_matrices.png'}")
-    print(f"Krzywa ROC:         {PROJECT_ROOT / 'data' / 'roc_curve.png'}")
+    print(f"Wykresy + tabele w: {PROJECT_ROOT / 'data'}")
+    print(f"Model w:            {models_dir / f'{algorithm}.pkl'}")
 
 
 if __name__ == "__main__":
-    main()
+    algo = sys.argv[1] if len(sys.argv) > 1 else "isolation_forest"
+    main(algo)

@@ -1,85 +1,103 @@
 # Detekcja anomalii w telemetrii drona
 
-Projekt semestralny: wykrywanie anomalii parametrów lotu (wysokość, prędkość, kurs, bateria)
-oraz nagłych zmian wskazujących na awarię lub incydent cybernetyczny.
+Projekt semestralny: trojwarstwowy detektor anomalii w telemetrii drona,
+trenowany na **Drone Telemetry Tampering Dataset v2** (Kaggle).
+
+## Architektura - 3 warstwy detekcji
+
+| Warstwa | Plik | Idea |
+|---|---|---|
+| 1 - progi fizyczne | `detection/rules.py` | Twarde zakresy: altitude, speed, heading, lat/lon |
+| 2 - statystyka | `detection/statistical.py` | Rolling z-score pochodnych + detekcja "freeze" (niska wariancja) |
+| 3 - ML | `detection/ml.py` | Cechy okienkowe + jeden z 5 algorytmow (IF / OCSVM / LOF / RF / XGBoost) |
 
 ## Wymagania
 
-- Python 3.9 lub nowszy
-- Pakiety: `numpy`, `pandas`, `matplotlib`, `scikit-learn`
+- Python 3.10 lub nowszy
+- Pakiety: `numpy`, `pandas`, `matplotlib`, `scikit-learn`, `xgboost` (opcjonalny)
 
-## Instalacja
-
-1. Otwórz PowerShell w katalogu projektu (tam, gdzie jest ten README).
-2. Zainstaluj pakiety:
-
-   ```powershell
-   python -m pip install numpy pandas matplotlib scikit-learn
-   ```
-
-## Uruchomienie
-
-**Najprostsza opcja — odpal wszystko jednym poleceniem:**
-
-```powershell
-python run_all.py
+```bash
+pip install numpy pandas matplotlib scikit-learn xgboost
 ```
 
-To wykona pełny pipeline:
-1. Generuje normalny lot (`data\normal_flight.csv`)
-2. Wstrzykuje 5 typów anomalii (`data\flight_with_anomalies.csv`)
-3. Tworzy wykres z detekcją (`data\telemetry_plot.png`)
+## Pobranie datasetu
 
-**Krok po kroku (jeśli chcesz uruchamiać moduły osobno):**
+1. Wejdz na [Kaggle - drone-telemetry-tampering-dataset-v2](https://www.kaggle.com/datasets/rasikaekanayakadevlk/drone-telemetry-tampering-dataset-v2)
+2. Pobierz CSV i zapisz jako `data/drone_telemetry_v2.csv`
 
-```powershell
-python data\generate.py            # tylko generator normalnego lotu
-python data\inject_anomalies.py    # generator + wstrzyknięcie anomalii
-python detection\rules.py          # test warstwy 1 (progi)
-python detection\statistical.py    # test warstwy 2 (nagłe zmiany)
-python notebooks\visualize.py      # wykres
+Alternatywnie przez Kaggle API:
+
+```bash
+kaggle datasets download -d rasikaekanayakadevlk/drone-telemetry-tampering-dataset-v2 -p data --unzip
 ```
 
-> **Uwaga:** moduły z `detection\` i `notebooks\` zakładają, że plik
-> `data\flight_with_anomalies.csv` już istnieje. Najpierw uruchom
-> `python data\inject_anomalies.py` albo `python run_all.py`.
+## Uruchomienie - cala pipeline
 
-## Struktura
-
-```
-drone_anomaly\
-├── run_all.py                  # uruchamia cały pipeline
-├── README.md
-├── data\
-│   ├── generate.py             # generator normalnego lotu
-│   ├── inject_anomalies.py     # wstrzykiwanie 5 scenariuszy anomalii
-│   ├── normal_flight.csv       # (generowany)
-│   ├── flight_with_anomalies.csv  # (generowany)
-│   └── telemetry_plot.png      # (generowany)
-├── detection\
-│   ├── rules.py                # warstwa 1: progi fizyczne
-│   └── statistical.py          # warstwa 2: rolling z-score
-└── notebooks\
-    └── visualize.py            # wykres telemetrii + alerty
+```bash
+python run_all.py                  # Isolation Forest (domyslnie)
+python run_all.py one_class_svm    # albo inny algorytm
+python run_all.py random_forest    # supervised
+python run_all.py xgboost          # supervised (wymaga xgboost)
 ```
 
-## Scenariusze anomalii
+Wynik:
+- `data/confusion_matrices.png` - macierze pomylek per warstwa
+- `data/roc_curves.png` - ROC dla warstwy ML + punkty operacyjne W1/W2
+- `data/case_<id>_plot.png` - telemetria przykladowego lotu
+- `data/metrics_global.csv`, `metrics_per_scenario.csv`, `metrics_per_profile.csv`
+- `models/<algorithm>.pkl` - wytrenowany model
 
-| Scenariusz | Opis | Co powinno wykryć |
+### Uruchamianie pojedynczych modulow
+
+```bash
+python data/loader.py            # podsumowanie datasetu
+python detection/rules.py        # tylko warstwa 1
+python detection/statistical.py  # tylko warstwa 2
+python detection/ml.py           # tylko warstwa 3 (IF)
+python notebooks/visualize.py    # wykres jednego case'a
+```
+
+## Trening na Google Colab
+
+Notebook `notebooks/train_colab.ipynb` (do dodania) trenuje wszystkie 5 algorytmow
+i zapisuje pickle'e do `models/`. Po pobraniu na lokalna maszyne mozna ich uzyc
+przez `AnomalyDetector.load(path)`.
+
+## Struktura datasetu
+
+| Kolumna | Opis |
+|---|---|
+| `case_id` | 720 unikalnych lotow |
+| `replicate` | 0..3 - 4 niezalezne realizacje kazdego case'a (split: 0,1,2=train; 3=test) |
+| `profile` | `subtle` / `balanced` / `strong` - intensywnosc anomalii |
+| `row_idx` | krok w locie (row_idx=0 odrzucamy - timestamp 1970) |
+| `label` | 0 / 1 - binarna etykieta anomalii |
+| `tamper_type` | `normal` + 9 typow manipulacji (patrz nizej) |
+| `timestamp` | epoch (sekundy) |
+| `latitude`, `longitude` | GPS [deg] |
+| `altitude` | wysokosc [m] |
+| `speed` | predkosc [m/s] |
+| `heading` | kurs [deg, 0..360) |
+| `source` | DJI_FLIGHTRECORD_BIN_DJI_LOG (real) lub SYNTH_* (syntetyczne) |
+
+### Klasy anomalii (tamper_type)
+
+| Klasa | Charakterystyka | Spodziewana wykrywalnosc |
 |---|---|---|
-| `engine_failure` | Gwałtowny spadek wysokości i prędkości | Warstwa 2 (sudden_altitude, sudden_speed) |
-| `gps_spoofing` | Skokowa zmiana kursu o ~180° | Warstwa 2 (sudden_heading) |
-| `battery_drain` | Nienaturalnie szybki spadek baterii | Warstwa 2 (sudden_battery), potem warstwa 1 |
-| `control_freeze` | Zacięcie sterów — parametry zamarzają | Warstwa 3 (do dodania) |
-| `sensor_jamming` | Silny szum we wszystkich sensorach | Warstwa 2 (wiele kanałów) |
+| `altitude_spike` | nagly skok wysokosci | W1 (jesli przekroczy prog) + W2 |
+| `coordinate_jump` | teleport GPS | W2 (sudden_gps_step) + W3 |
+| `heading_inconsistency` | niespojny kurs | W2 (sudden_heading) + W3 |
+| `speed_inconsistency` | predkosc sensora != predkosc z GPS | W3 (cecha `speed_vs_gps`) |
+| `timestamp_drift` | skok timestamp | W3 (przez `speed_vs_gps`) |
+| `injection` | dolozone falszywe wiersze | W2 / W3 |
+| `deletion_gap` | luka w probkach | W3 (cechy okienkowe) |
+| `precision_rounding` | obciecie precyzji | W3 (subtelna anomalia kontekstowa) |
+| `combined` | wiele typow razem | wszystkie warstwy |
 
-## Status projektu
+## Format wynikow ewaluacji
 
-- [x] Generator normalnego lotu
-- [x] Wstrzykiwanie 5 scenariuszy anomalii
-- [x] Warstwa 1 — progi fizyczne
-- [x] Warstwa 2 — rolling z-score (wykrywanie nagłych zmian)
-- [x] Wizualizacja
-- [ ] Warstwa 3 — Isolation Forest (scikit-learn)
-- [ ] Moduł ewaluacji: precision / recall / F1 per warstwa per scenariusz
-- [ ] Raport końcowy (Jupyter notebook)
+`compute_full_evaluation` zwraca 3 tabele:
+
+1. **Globalne**: precision/recall/F1 per warstwa
+2. **Per `tamper_type`**: recall per warstwa per typ anomalii (jaki % danego typu zlapano)
+3. **Per `profile`**: recall per warstwa per intensywnosc (subtle/balanced/strong)
