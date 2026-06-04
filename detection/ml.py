@@ -72,9 +72,9 @@ def _features_one_case(case_df: pd.DataFrame, window: int) -> pd.DataFrame:
     feats["gps_step_std"] = gps_step.rolling(window=window, min_periods=min_p).std()
     feats["gps_step_max"] = gps_step.rolling(window=window, min_periods=min_p).max()
 
-    # Roznica miedzy predkoscia sensora a predkoscia z GPS
-    # (zaklada sample rate ~1 Hz - jesli inny, korekta byc moze potrzebna)
-    dt = case_df["timestamp"].diff().replace(0, np.nan)
+    # Roznica miedzy predkoscia sensora a predkoscia z GPS.
+    # timestamp jest pd.Timestamp -> diff() to Timedelta, konwertujemy do sekund.
+    dt = case_df["timestamp"].diff().dt.total_seconds().replace(0, np.nan)
     gps_speed = gps_step / dt
     feats["speed_vs_gps"] = (case_df["speed"] - gps_speed).abs()
     feats["speed_vs_gps"] = feats["speed_vs_gps"].rolling(window=window, min_periods=min_p).mean()

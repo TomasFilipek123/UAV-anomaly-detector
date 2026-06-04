@@ -8,10 +8,12 @@ Etykiety:
   - profile      : subtle / balanced / strong  (intensywnosc anomalii)
 
 Konwencje preprocessingu:
+  - Timestamp jest w formacie ISO 8601 (np. 2024-09-15T20:05:41.726000+00:00) -
+    parsujemy do pandas.Timestamp z timezone UTC.
   - Wiersze z row_idx == 0 odrzucamy (timestamp 1970, niespojny).
   - Train/test split: replicate in {0,1,2} -> train, replicate == 3 -> test.
-  - Dla kazdego case_id dodajemy kolumne `t_rel` (czas od startu lotu w sekundach),
-    bo timestamp datasetu jest absolutny (epoch).
+  - Dla kazdego case_id dodajemy kolumne `t_rel` (czas od startu lotu w sekundach,
+    float), bo absolutny timestamp jest niewygodny w rolling/diff.
 """
 
 from pathlib import Path
@@ -61,7 +63,11 @@ def load_dataset(
             f"i umiesc plik w {path.parent}."
         )
 
-    df = pd.read_csv(path, usecols=list(usecols) if usecols else None)
+    df = pd.read_csv(
+        path,
+        usecols=list(usecols) if usecols else None,
+        parse_dates=["timestamp"],
+    )
 
     missing = EXPECTED_COLUMNS - set(df.columns)
     if missing and usecols is None:
@@ -72,8 +78,11 @@ def load_dataset(
 
     df = df.sort_values(["case_id", "row_idx"], kind="stable").reset_index(drop=True)
 
-    # Czas od startu lotu (sekundy)
-    df["t_rel"] = df.groupby("case_id")["timestamp"].transform(lambda s: s - s.min())
+    # Czas od startu lotu w sekundach (float).
+    # transform zwraca Timedelta - konwertujemy do total_seconds().
+    df["t_rel"] = df.groupby("case_id")["timestamp"].transform(
+        lambda s: (s - s.min()).dt.total_seconds()
+    )
 
     return df
 
@@ -97,11 +106,12 @@ def clean_subset(df: pd.DataFrame) -> pd.DataFrame:
 
 def sample_rate_per_case(df: pd.DataFrame) -> pd.Series:
     """
-    Dla kazdego case_id zwraca median(diff(timestamp)) - czyli typowy odstep miedzy probkami.
-    Pozwala oszacowac sample rate (1/diff).
+    Dla kazdego case_id zwraca median(diff(timestamp)) w sekundach - typowy
+    odstep miedzy probkami. Pozwala oszacowac sample rate (1/diff).
     """
     return df.groupby("case_id")["timestamp"].apply(
-        lambda s: np.median(np.diff(s.values)) if len(s) > 1 else np.nan
+        lambda s: float(np.median(np.diff(s.values).astype("timedelta64[ns]").astype(np.int64))) / 1e9
+        if len(s) > 1 else np.nan
     )
 
 
