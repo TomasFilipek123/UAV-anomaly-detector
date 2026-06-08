@@ -3,7 +3,11 @@ __pycache__/
 *.pkl
 
 data/*.csv
+data/*.png
 !data/.gitkeep
 
 models/
 .ipynb_checkpoints/
+
+# Artefakty eksportu z Colab
+*.zip
