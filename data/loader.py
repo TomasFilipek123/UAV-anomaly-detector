@@ -66,12 +66,16 @@ def load_dataset(
     df = pd.read_csv(
         path,
         usecols=list(usecols) if usecols else None,
-        parse_dates=["timestamp"],
     )
 
     missing = EXPECTED_COLUMNS - set(df.columns)
     if missing and usecols is None:
         raise ValueError(f"Brakujace kolumny w datasecie: {sorted(missing)}")
+
+    # Jawne parsowanie timestamp (parse_dates w read_csv bywa zawodny
+    # przy mieszanym formacie ISO 8601 z offset strefy). utc=True normalizuje
+    # do UTC i daje dtype datetime64[ns, UTC].
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
 
     # row_idx == 0 ma timestamp 1970 (epoch 0) - usuwamy z kazdego lotu
     df = df[df["row_idx"] > 0].copy()

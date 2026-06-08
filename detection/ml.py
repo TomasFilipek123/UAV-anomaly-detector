@@ -11,6 +11,7 @@ Cechy okienkowe (15+) liczone niezaleznie per case_id:
   heading   : diff_mean, diff_std, diff_abs_max  (na cyklicznych roznicach)
   gps_step  : mean, std, max                     (haversine miedzy probkami)
   speed_vs_gps : roznica miedzy speed sensora a predkoscia liczona z GPS
+  dt        : mean, std, max, min                 (odstepy czasowe miedzy probkami)
   sample_var_score : suma std-ow (sygnal "zamrozenia")
 """
 
@@ -72,12 +73,27 @@ def _features_one_case(case_df: pd.DataFrame, window: int) -> pd.DataFrame:
     feats["gps_step_std"] = gps_step.rolling(window=window, min_periods=min_p).std()
     feats["gps_step_max"] = gps_step.rolling(window=window, min_periods=min_p).max()
 
-    # Roznica miedzy predkoscia sensora a predkoscia z GPS.
+    # Odstep czasowy miedzy probkami (sekundy).
     # timestamp jest pd.Timestamp -> diff() to Timedelta, konwertujemy do sekund.
-    dt = case_df["timestamp"].diff().dt.total_seconds().replace(0, np.nan)
+    dt_raw = case_df["timestamp"].diff().dt.total_seconds()
+    dt = dt_raw.replace(0, np.nan)  # do gps_speed - unikamy dzielenia przez 0
+
+    # Roznica miedzy predkoscia sensora a predkoscia z GPS.
     gps_speed = gps_step / dt
     feats["speed_vs_gps"] = (case_df["speed"] - gps_speed).abs()
     feats["speed_vs_gps"] = feats["speed_vs_gps"].rolling(window=window, min_periods=min_p).mean()
+
+    # Cechy z odstepow czasowych - celuja w tampery, ktore zaburzaja regularnosc
+    # probkowania, a nie ich wartosci fizyczne (recall ~0% bez tego):
+    #   deletion_gap -> duza luka czasowa (dt_max)
+    #   injection    -> zdublowany/wstrzyniety timestamp, dt ~ 0 (dt_min)
+    #   timestamp_drift -> nieregularne dt (dt_std)
+    # Uzywamy dt_raw (z zerami), bo dt==0 to wlasnie sygnal injection.
+    dt_roll = dt_raw.rolling(window=window, min_periods=min_p)
+    feats["dt_mean"] = dt_roll.mean()
+    feats["dt_std"] = dt_roll.std()
+    feats["dt_max"] = dt_roll.max()
+    feats["dt_min"] = dt_roll.min()
 
     feats["sample_var_score"] = (
         feats["alt_std"].fillna(0)
@@ -108,6 +124,16 @@ SUPPORTED_ALGOS = {"isolation_forest", "one_class_svm", "lof", "random_forest", 
 UNSUPERVISED = {"isolation_forest", "one_class_svm", "lof"}
 SUPERVISED = {"random_forest", "xgboost"}
 
+# Domyslny limit probek treningowych dla algorytmow O(n^2).
+# Wartosc None oznacza "brak limitu" - algorytm dostaje wszystko.
+DEFAULT_MAX_TRAIN_SAMPLES = {
+    "one_class_svm": 50_000,
+    "lof":           50_000,
+    "isolation_forest": None,
+    "random_forest":    None,
+    "xgboost":          None,
+}
+
 
 @dataclass
 class AnomalyDetector:
@@ -132,6 +158,7 @@ class AnomalyDetector:
     algorithm: str
     window: int = 8
     threshold_percentile: float = 2.0
+    max_train_samples: int | None = None  # None -> uzyj DEFAULT_MAX_TRAIN_SAMPLES
     params: dict = field(default_factory=dict)
 
     model: object = field(default=None, init=False)
@@ -141,6 +168,8 @@ class AnomalyDetector:
     def __post_init__(self):
         if self.algorithm not in SUPPORTED_ALGOS:
             raise ValueError(f"Nieznany algorytm: {self.algorithm}. Dostepne: {SUPPORTED_ALGOS}")
+        if self.max_train_samples is None:
+            self.max_train_samples = DEFAULT_MAX_TRAIN_SAMPLES.get(self.algorithm)
 
     def _build_estimator(self):
         a = self.algorithm
@@ -164,9 +193,13 @@ class AnomalyDetector:
                 n_jobs=-1,
             )
         if a == "random_forest":
+            # max_depth=None rosnie az do czystych lisci -> na milionach probek
+            # pickle puchnie do dziesiatkow GB. Ograniczamy glebokosc i wielkosc
+            # lisci: model schodzi do ~kilkudziesieciu MB przy minimalnej stracie AUC.
             return RandomForestClassifier(
                 n_estimators=self.params.get("n_estimators", 200),
-                max_depth=self.params.get("max_depth", None),
+                max_depth=self.params.get("max_depth", 16),
+                min_samples_leaf=self.params.get("min_samples_leaf", 20),
                 class_weight=self.params.get("class_weight", "balanced"),
                 random_state=self.params.get("random_state", 42),
                 n_jobs=-1,
@@ -188,30 +221,57 @@ class AnomalyDetector:
             )
         raise ValueError(self.algorithm)
 
-    def fit(self, df_train: pd.DataFrame) -> "AnomalyDetector":
+    def fit(
+        self,
+        df_train: pd.DataFrame,
+        features: pd.DataFrame | None = None,
+    ) -> "AnomalyDetector":
         """
         Trenuje detektor.
           - unsupervised : filtruje df_train do label==0 i uczy na czystych probkach
           - supervised   : uczy na calym df_train uzywajac kolumny 'label'
+
+        Jezeli `features` podane (wynik compute_features() dla df_train),
+        nie liczymy ich ponownie - przyspiesza istotnie gdy ten sam df_train
+        idzie do wielu detektorow z rzedu (cache w notebooku).
+
+        Jezeli `max_train_samples` jest ustawione i zbior po filtrze jest wiekszy,
+        losowo podsemplujemy (random_state z self.params).
         """
-        feats = compute_features(df_train, window=self.window)
-        self.feature_names = list(feats.columns)
-        X = feats.values
+        if features is None:
+            features = compute_features(df_train, window=self.window)
+        self.feature_names = list(features.columns)
+        X = features.values
 
         self.model = self._build_estimator()
+        rng = np.random.default_rng(self.params.get("random_state", 42))
 
         if self.algorithm in UNSUPERVISED:
             mask = df_train["label"].values == 0
             X_train = X[mask]
+            X_train = self._maybe_subsample(X_train, rng)
             self.model.fit(X_train)
-            # Prog z percentyla scores na czystym zbiorze treningowym
+            # Prog z percentyla scores na zbiorze uzytym do treningu
             scores = self._raw_scores(X_train)
             self.threshold = float(np.percentile(scores, self.threshold_percentile))
         else:
             y = df_train["label"].astype(int).values
-            self.model.fit(X, y)
+            X_train, y_train = self._maybe_subsample_xy(X, y, rng)
+            self.model.fit(X_train, y_train)
 
         return self
+
+    def _maybe_subsample(self, X: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        if self.max_train_samples and len(X) > self.max_train_samples:
+            idx = rng.choice(len(X), size=self.max_train_samples, replace=False)
+            return X[idx]
+        return X
+
+    def _maybe_subsample_xy(self, X, y, rng):
+        if self.max_train_samples and len(X) > self.max_train_samples:
+            idx = rng.choice(len(X), size=self.max_train_samples, replace=False)
+            return X[idx], y[idx]
+        return X, y
 
     def _raw_scores(self, X: np.ndarray) -> np.ndarray:
         """
@@ -228,22 +288,29 @@ class AnomalyDetector:
             return self.model.predict_proba(X)[:, 1]
         raise ValueError(self.algorithm)
 
-    def predict(self, df_test: pd.DataFrame) -> pd.DataFrame:
+    def predict(
+        self,
+        df_test: pd.DataFrame,
+        features: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
         """
         Zwraca df_test z dodanymi kolumnami:
           - alert_ml  : bool
           - ml_score  : float (semantyka zalezna od algorytmu)
             * unsupervised : nizszy = bardziej anomalna (jak w IsolationForest.score_samples)
             * supervised   : p(label=1) (wyzszy = bardziej anomalna)
+
+        Jezeli `features` podane, nie liczymy ich ponownie (cache).
         """
         if self.model is None:
             raise RuntimeError("Wywolaj fit() przed predict()")
 
-        feats = compute_features(df_test, window=self.window)
-        if list(feats.columns) != self.feature_names:
+        if features is None:
+            features = compute_features(df_test, window=self.window)
+        if list(features.columns) != self.feature_names:
             warnings.warn("Kolejnosc cech zmieniona - poprawiam.")
-            feats = feats[self.feature_names]
-        X = feats.values
+            features = features[self.feature_names]
+        X = features.values
 
         scores = self._raw_scores(X)
         if self.algorithm in UNSUPERVISED:

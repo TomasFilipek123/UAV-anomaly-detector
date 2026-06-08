@@ -22,7 +22,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from data.loader import load_dataset, split_by_replicate, summarize
 from detection.rules import detect_threshold_violations
 from detection.statistical import detect_sudden_changes
-from detection.ml import AnomalyDetector
+from detection.ml import AnomalyDetector, compute_features
 from evaluation.metrics import run_full_evaluation
 from notebooks.visualize import plot_case, pick_case_with_anomalies
 
@@ -60,8 +60,15 @@ def main(algorithm: str = "isolation_forest") -> None:
     print("=" * 60)
     print(f"KROK 5: Warstwa 3 - ML ({algorithm})")
     print("=" * 60)
-    detector = AnomalyDetector(algorithm=algorithm).fit(train)
-    test = detector.predict(test)
+    # Cechy okienkowe liczymy raz dla train i raz dla test (gdyby trenowac
+    # wiele algorytmow z rzedu - cache zaoszczedzilby kilka minut na pelnym datasecie).
+    print("Liczenie cech okienkowych (train)...")
+    train_features = compute_features(train, window=8)
+    print("Liczenie cech okienkowych (test)...")
+    test_features = compute_features(test, window=8)
+
+    detector = AnomalyDetector(algorithm=algorithm).fit(train, features=train_features)
+    test = detector.predict(test, features=test_features)
     print(f"Alerty W3: {test['alert_ml'].sum():,}/{len(test):,}")
 
     # Zapis modelu

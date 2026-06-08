@@ -9,7 +9,7 @@ trenowany na **Drone Telemetry Tampering Dataset v2** (Kaggle).
 |---|---|---|
 | 1 - progi fizyczne | `detection/rules.py` | Twarde zakresy: altitude, speed, heading, lat/lon |
 | 2 - statystyka | `detection/statistical.py` | Rolling z-score pochodnych + detekcja "freeze" (niska wariancja) |
-| 3 - ML | `detection/ml.py` | Cechy okienkowe + jeden z 5 algorytmow (IF / OCSVM / LOF / RF / XGBoost) |
+| 3 - ML | `detection/ml.py` | 19 cech okienkowych (altitude/speed/heading/gps_step/dt) + jeden z 5 algorytmow (IF / OCSVM / LOF / RF / XGBoost) |
 
 ## Wymagania
 
@@ -59,9 +59,29 @@ python notebooks/visualize.py    # wykres jednego case'a
 
 ## Trening na Google Colab
 
-Notebook `notebooks/train_colab.ipynb` (do dodania) trenuje wszystkie 5 algorytmow
-i zapisuje pickle'e do `models/`. Po pobraniu na lokalna maszyne mozna ich uzyc
-przez `AnomalyDetector.load(path)`.
+Notebook `notebooks/train_colab.ipynb` trenuje wszystkie 5 algorytmow i zapisuje
+pickle'e do `models/`. Po pobraniu na lokalna maszyne mozna ich uzyc przez
+`AnomalyDetector.load(path)`.
+
+> **Uwaga o rozmiarze RF:** Random Forest jest ograniczony (`max_depth=16`,
+> `min_samples_leaf=20`) - bez tego na milionach probek pickle puchnie do ~20 GB.
+> Przy zmianie cech trzeba przetrenowac modele od nowa (stare `.pkl` maja zapisany
+> stary zestaw `feature_names`).
+
+## Wyniki (replicate 3 = test, profile mieszane)
+
+Porownanie warstwy ML wg AUC (`data/roc_curves_all_algos.png`):
+
+| Algorytm | AUC |
+|---|---|
+| **xgboost** | **0.695** |
+| random_forest | 0.678 |
+| isolation_forest | 0.631 |
+| lof | 0.573 |
+| one_class_svm | 0.498 (≈ losowy) |
+
+XGBoost daje najlepszy rozdzial przy znikomym rozmiarze modelu (~1 MB), wiec to
+rekomendowany wybor warstwy 3.
 
 ## Struktura datasetu
 
@@ -88,9 +108,9 @@ przez `AnomalyDetector.load(path)`.
 | `coordinate_jump` | teleport GPS | W2 (sudden_gps_step) + W3 |
 | `heading_inconsistency` | niespojny kurs | W2 (sudden_heading) + W3 |
 | `speed_inconsistency` | predkosc sensora != predkosc z GPS | W3 (cecha `speed_vs_gps`) |
-| `timestamp_drift` | skok timestamp | W3 (przez `speed_vs_gps`) |
-| `injection` | dolozone falszywe wiersze | W2 / W3 |
-| `deletion_gap` | luka w probkach | W3 (cechy okienkowe) |
+| `timestamp_drift` | skok timestamp | W3 (cecha `dt_std`) |
+| `injection` | dolozone falszywe wiersze | W2 / W3 (cecha `dt_min` ~ 0) |
+| `deletion_gap` | luka w probkach | W3 (cecha `dt_max`) |
 | `precision_rounding` | obciecie precyzji | W3 (subtelna anomalia kontekstowa) |
 | `combined` | wiele typow razem | wszystkie warstwy |
 
