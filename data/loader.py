@@ -72,6 +72,16 @@ def load_dataset(
     if missing and usecols is None:
         raise ValueError(f"Brakujace kolumny w datasecie: {sorted(missing)}")
 
+    # Wymuszamy typy numeryczne - czasem read_csv wnioskuje kolumne jako object
+    # (string), gdy trafi sie pojedynczy nietypowy token. Wtedy .diff()/odejmowanie
+    # w warstwach 2/3 wywala sie z "unsupported operand -: 'str' and 'str'".
+    # errors="coerce" zamienia niepoprawne wartosci na NaN.
+    NUMERIC_COLS = ["latitude", "longitude", "altitude", "speed", "heading",
+                    "row_idx", "replicate", "label"]
+    for col in NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     # Jawne parsowanie timestamp (parse_dates w read_csv bywa zawodny
     # przy mieszanym formacie ISO 8601 z offset strefy). utc=True normalizuje
     # do UTC i daje dtype datetime64[ns, UTC].
