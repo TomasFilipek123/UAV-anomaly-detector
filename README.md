@@ -97,10 +97,13 @@ przed dodaniem cech -> po:
 | `speed_inconsistency` | 0% | 32% |
 | `deletion_gap` | 0% | ~1% (wciaz slabo - patrz nizej) |
 
-`deletion_gap` pozostaje nieuchwytny dla `dt_*` - usuniecie probek nie zostawia
-skoku `dt` (timestampy sa przenumerowane). Kandydat na dalsza prace: cecha
-`original_row_idx.diff()` (przy deletion_gap `original_row_idx` ma dziury,
-a `row_idx` jest ciagle).
+`deletion_gap` pozostaje slaby, ale to **artefakt etykietowania, nie brak cechy**.
+Przy delecji `dt` faktycznie skacze (0.101 s -> ~2.2 s), wiec `dt_max` widzi sygnal -
+problem w tym, ze delecja to zdarzenie **jednowierszowe**, a dataset oznacza jako
+anomalie **szeroki pas** wierszy wokol niej. Wiekszosc tych oznaczonych probek jest
+fizycznie identyczna z `normal`, wiec zaden uczciwy feature ich nie odroznii.
+Kolumna `original_row_idx` rozwiazalaby to tylko przez **leakage** (to metadana
+konstrukcji datasetu, nieobecna w realnej telemetrii) - swiadomie jej nie uzywamy.
 
 ## Struktura datasetu
 
