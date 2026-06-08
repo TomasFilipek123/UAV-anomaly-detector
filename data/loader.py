@@ -82,10 +82,14 @@ def load_dataset(
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Jawne parsowanie timestamp (parse_dates w read_csv bywa zawodny
-    # przy mieszanym formacie ISO 8601 z offset strefy). utc=True normalizuje
-    # do UTC i daje dtype datetime64[ns, UTC].
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    # Jawne parsowanie timestamp. format="ISO8601" jest KONIECZNE: bez niego
+    # pandas 2.x wnioskuje format z pierwszego wiersza (row_idx=0 ma czas
+    # "...:00+00:00" bez ulamkow sekundy), a potem coerce'uje do NaT wszystkie
+    # realne timestampy z mikrosekundami ("....726000+00:00") - czyli 99.9% danych.
+    # ISO8601 obsluguje zmienna precyzje; utc=True daje datetime64[ns, UTC].
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"], utc=True, format="ISO8601", errors="coerce"
+    )
 
     # row_idx == 0 ma timestamp 1970 (epoch 0) - usuwamy z kazdego lotu
     df = df[df["row_idx"] > 0].copy()
