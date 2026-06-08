@@ -96,6 +96,13 @@ def detect_sudden_changes(
         config = DEFAULT_CONFIG
 
     df = df.copy()
+    # Zabezpieczenie: kanaly numeryczne moga przyjsc jako object (string), jesli
+    # df nie przeszedl przez loader. Bez tego diff()/haversine wywala sie z
+    # "unsupported operand -: 'str' and 'str'".
+    for col in ("altitude", "speed", "heading", "latitude", "longitude"):
+        if col in df.columns and df[col].dtype == object:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     w = config["window"]
     th = config["z_threshold"]
     min_std = config["min_std"]

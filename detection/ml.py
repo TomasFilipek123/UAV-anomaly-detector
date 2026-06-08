@@ -110,6 +110,16 @@ def compute_features(df: pd.DataFrame, window: int = 8) -> pd.DataFrame:
     Liczy cechy okienkowe dla calego DataFrame, grupujac per case_id.
     Wypelnia NaN-y (bfill + 0) na koncu - kazda probka ma kompletny wektor cech.
     """
+    # Zabezpieczenie: kanaly numeryczne moga przyjsc jako object (string), jesli
+    # df nie przeszedl przez loader - wtedy diff()/haversine wywala sie z
+    # "unsupported operand -: 'str' and 'str'". Kopiujemy tylko gdy trzeba.
+    obj_cols = [c for c in ("altitude", "speed", "heading", "latitude", "longitude")
+                if c in df.columns and df[c].dtype == object]
+    if obj_cols:
+        df = df.copy()
+        for c in obj_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     parts = []
     for _, case_df in df.groupby("case_id", sort=False):
         parts.append(_features_one_case(case_df, window))
