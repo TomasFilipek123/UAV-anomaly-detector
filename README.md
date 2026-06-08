@@ -72,16 +72,35 @@ pickle'e do `models/`. Po pobraniu na lokalna maszyne mozna ich uzyc przez
 
 Porownanie warstwy ML wg AUC (`data/roc_curves_all_algos.png`):
 
-| Algorytm | AUC |
-|---|---|
-| **xgboost** | **0.695** |
-| random_forest | 0.678 |
-| isolation_forest | 0.631 |
-| lof | 0.573 |
-| one_class_svm | 0.498 (≈ losowy) |
+| Algorytm | AUC | rozmiar pkl |
+|---|---|---|
+| **random_forest** | **0.751** | 213 MB |
+| xgboost | 0.743 | 0.9 MB |
+| isolation_forest | 0.664 | 1 MB |
+| lof | 0.592 | 17 MB |
+| one_class_svm | 0.471 (≈ losowy) | 0.4 MB |
 
-XGBoost daje najlepszy rozdzial przy znikomym rozmiarze modelu (~1 MB), wiec to
-rekomendowany wybor warstwy 3.
+**Rekomendacja: Random Forest** - najlepszy rozdzial i przy progu 0.5 najwyzszy
+recall (~70% per profile). XGBoost ma zblizone AUC, ale przy progu 0.5 odpala
+zachowawczo (recall ~30%) - jego prawdopodobienstwa sa ostrozniejsze.
+
+### Wplyw cech czasowych `dt_*`
+
+Dodanie 4 cech z odstepow czasowych (`dt_mean/std/max/min`) bylo kluczowe dla
+manipulacji zaburzajacych regularnosc probkowania. Recall RF dla warstwy 3,
+przed dodaniem cech -> po:
+
+| tamper_type | przed | po |
+|---|---|---|
+| `timestamp_drift` | 0% | **84%** |
+| `injection` | 0% | **66%** |
+| `speed_inconsistency` | 0% | 32% |
+| `deletion_gap` | 0% | ~1% (wciaz slabo - patrz nizej) |
+
+`deletion_gap` pozostaje nieuchwytny dla `dt_*` - usuniecie probek nie zostawia
+skoku `dt` (timestampy sa przenumerowane). Kandydat na dalsza prace: cecha
+`original_row_idx.diff()` (przy deletion_gap `original_row_idx` ma dziury,
+a `row_idx` jest ciagle).
 
 ## Struktura datasetu
 
@@ -93,7 +112,7 @@ rekomendowany wybor warstwy 3.
 | `row_idx` | krok w locie (row_idx=0 odrzucamy - timestamp 1970) |
 | `label` | 0 / 1 - binarna etykieta anomalii |
 | `tamper_type` | `normal` + 9 typow manipulacji (patrz nizej) |
-| `timestamp` | epoch (sekundy) |
+| `timestamp` | ISO 8601 z offsetem UTC (np. `2024-09-15T20:05:41.726000+00:00`); parsowany z `format="ISO8601"` |
 | `latitude`, `longitude` | GPS [deg] |
 | `altitude` | wysokosc [m] |
 | `speed` | predkosc [m/s] |
