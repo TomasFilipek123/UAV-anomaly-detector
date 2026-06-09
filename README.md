@@ -14,11 +14,16 @@ trenowany na **Drone Telemetry Tampering Dataset v2** (Kaggle).
 ## Wymagania
 
 - Python 3.10 lub nowszy
-- Pakiety: `numpy`, `pandas`, `matplotlib`, `scikit-learn`, `xgboost` (opcjonalny)
+- Pakiety: `numpy`, `pandas`, `matplotlib`, `scikit-learn`, `xgboost`
 
 ```bash
-pip install numpy pandas matplotlib scikit-learn xgboost
+pip install -r requirements.txt
 ```
+
+> **Wazne przypiecia wersji** (w `requirements.txt`): `scikit-learn==1.6.1` (zgodne
+> z zapisanymi modelami `.pkl`) oraz `pandas<3` (kod warstw 2/3 nie dziala na
+> pandas 3.0). Na systemach z PEP668 / bez systemowego pip:
+> `python3 -m pip install --user --break-system-packages -r requirements.txt`.
 
 ## Pobranie datasetu
 
@@ -56,6 +61,68 @@ python detection/statistical.py  # tylko warstwa 2
 python detection/ml.py           # tylko warstwa 3 (IF)
 python notebooks/visualize.py    # wykres jednego case'a
 ```
+
+## Detekcja w czasie rzeczywistym (streaming)
+
+Pakiet `streaming/` symuluje strumien telemetrii i prowadzi detekcje **online** -
+probka po probce, tak jak wygladaloby to przy zywym dronie. Dwa moduly spiete
+kolejka w pamieci (`queue.Queue`) + watki:
+
+| Modul | Rola |
+|---|---|
+| `streaming/generator.py` | `TelemetryGenerator` - odtwarza dataset probka po probce na kolejke, z zachowaniem tempa z `t_rel` (skroconego o `--speed`) |
+| `streaming/consumer.py` | `StreamConsumer` - bufor krok-po-kroku per `case_id`, na kazdej probce odpala **wszystkie 3 warstwy** i emituje alert gdy ktorakolwiek zaalarmuje |
+| `streaming/alerts.py` | `Alert` + sinki: `ConsoleAlertSink`, `JsonlAlertSink`, `MultiSink` |
+| `streaming/run_stream.py` | punkt wejscia / demo - spina generator (watek) z konsumentem |
+
+**Jak to dziala (okienkowosc):** warstwy 2 i 3 sa okienkowe (z-score liczy okno 30
+probek, ML - 8), wiec konsument utrzymuje **bufor kroczacy `deque` per `case_id`**.
+Po kazdej nowej probce buduje mini-DataFrame z bufora, uruchamia na nim istniejace
+funkcje detekcji (`detect_threshold_violations`, `detect_sudden_changes`,
+`compute_features` + `AnomalyDetector.predict`) i bierze wynik **ostatniego wiersza**.
+
+```bash
+# demo: 2 loty, limit 800 probek, czas x200, alerty tez do pliku JSONL
+python -m streaming.run_stream random_forest --cases 2 --max-samples 800 --speed 200 --jsonl
+
+# tylko warstwa ML (model nie jest ladowany dla pozostalych trybow)
+python -m streaming.run_stream random_forest --layers ml
+
+# tylko tanie warstwy bezmodelowe (rules + statistical)
+python -m streaming.run_stream --layers rules,statistical
+
+# pelny strumien (bez limitu probek)
+python -m streaming.run_stream random_forest --max-samples 0
+```
+
+Parametry CLI: `--cases N` (ile lotow), `--max-samples N` (limit probek, `0` = bez
+limitu), `--speed F` (przyspieszenie czasu, `1.0` = realny), `--replicate R`
+(domyslnie 3 = zbior testowy), `--layers` (`all` lub lista po przecinku z
+`{rules,statistical,ml}` - przez ktore warstwy przepuscic strumien),
+`--ml-threshold T` (prog decyzyjny warstwy ML), `--jsonl`
+(zapis alertow do `data/alerts.jsonl`).
+
+> **Prog ML (`--ml-threshold`):** steruje czuloscia warstwy 3. Dla modeli supervised
+> (RF/XGBoost) `ml_score` to p(anomalia), a alert pada gdy `score >= prog`
+> (domyslnie 0.5). Podniesienie progu = mniej alertow, wyzsza precyzja, nizszy recall.
+> Przyklad (RF, ten sam wycinek 300 probek): `0.5` -> P=0.50 R=0.83; `0.7` -> P=0.77
+> R=0.52; `0.9` -> P=1.00 R=0.19. Dla modeli unsupervised (IF/OCSVM/LOF) semantyka
+> jest odwrotna (nizszy score = bardziej anomalna), wiec alert pada gdy `score < prog`.
+
+> **Wybor warstw (`--layers`):** mozna przepuscic strumien tylko przez czesc
+> pipeline'u, np. `--layers ml` (sam model) albo `--layers rules,statistical`
+> (lekko, bez ladowania modelu). Bufor kroczacy dobiera sie automatycznie do
+> najwiekszego okna wsrod aktywnych warstw (ml-only -> 18 probek, ze statistical -> 40),
+> wiec wylaczenie warstwy statystycznej dodatkowo przyspiesza przetwarzanie.
+
+Wymaga wczesniej zapisanego modelu (`models/<algorithm>.pkl`) - jesli go brak,
+najpierw `python run_all.py <algorithm>`. Na koncu drukowane jest podsumowanie
+(precision/recall/F1 wzgledem `label`), bo odtwarzamy etykietowany dataset.
+
+> **Wydajnosc:** Random Forest to ~0.1 s/probke (200 drzew) - stad domyslny limit
+> `--max-samples`. Dla szybszego real-time uzyj lzejszego modelu (`isolation_forest`,
+> 1 MB). Metryki z malego `--max-samples` **nie sa reprezentatywne** (waski, gesty
+> w anomaliach wycinek) - po porownywalne z offline liczby uruchom bez limitu.
 
 ## Trening na Google Colab
 

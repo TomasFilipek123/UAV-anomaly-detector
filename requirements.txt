@@ -1,0 +1,9 @@
+# Wersje przypiete do srodowiska, w ktorym powstaly modele (.pkl) i metryki.
+# - scikit-learn 1.6.1: zgodne z zapisanymi modelami (pickle), bez ostrzezen o wersji.
+# - pandas <3: kod warstw 2/3 korzysta z groupby.transform(rolling) dzialajacego
+#   inaczej w pandas 3.0 ("No objects to concatenate" na malych grupach).
+numpy>=1.26,<3
+pandas>=2.1,<3
+matplotlib>=3.7
+scikit-learn==1.6.1
+xgboost>=2.0

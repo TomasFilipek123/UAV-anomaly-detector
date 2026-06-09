@@ -11,3 +11,10 @@ models/
 
 # Artefakty eksportu z Colab
 *.zip
+
+# Srodowiska i IDE
+.venv/
+.idea/
+
+# Alerty generowane przez streaming
+data/*.jsonl

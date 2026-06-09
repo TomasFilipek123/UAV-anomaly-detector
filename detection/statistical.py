@@ -58,12 +58,15 @@ def _per_case_diffs(df: pd.DataFrame) -> dict:
         "speed": g["speed"].diff(),
         "heading": g["heading"].apply(_circular_diff),
     }
-    # GPS step liczymy per case
-    gps_step = g.apply(
-        lambda x: pd.Series(_haversine_step(x["latitude"].values, x["longitude"].values),
-                             index=x.index)
-    )
-    diffs["gps_step"] = gps_step.droplevel(0) if isinstance(gps_step.index, pd.MultiIndex) else gps_step
+    # GPS step liczymy per case. Petla zamiast g.apply(): apply() przy POJEDYNCZYM
+    # case_id (np. bufor strumieniowy z jednym lotem) zwija wynik do dlugosci 1
+    # zamiast N i nie tworzy MultiIndex -> blad "No objects to concatenate" w
+    # kolejnym rolling. Petla daje identyczny wynik dla 1 i wielu grup.
+    gps_step = pd.Series(np.nan, index=df.index, dtype=float)
+    for _, idx in g.groups.items():
+        sub = df.loc[idx]
+        gps_step.loc[idx] = _haversine_step(sub["latitude"].values, sub["longitude"].values)
+    diffs["gps_step"] = gps_step
     return diffs
 
 
