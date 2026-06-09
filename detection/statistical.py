@@ -15,6 +15,8 @@ nastepnego (dalo by to ogromne, falszywe skoki).
 import numpy as np
 import pandas as pd
 
+from .utils import circular_diff, ensure_numeric_columns, haversine_step, rolling_by_case
+
 
 DEFAULT_CONFIG = {
     "window": 30,              # okno z-score (w probkach, nie sekundach!)
@@ -29,52 +31,18 @@ DEFAULT_CONFIG = {
 PARAM_CHANNELS = ["altitude", "speed", "heading", "gps_step"]
 
 
-def _circular_diff(series: pd.Series) -> pd.Series:
-    """Pochodna kursu z poprawnym wrap-around (359 -> 1 = 2deg, nie -358deg)."""
-    raw = series.diff()
-    return ((raw + 180) % 360) - 180
-
-
-def _haversine_step(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
-    """
-    Odleglosc Haversine miedzy kolejnymi probkami [m].
-    Pierwsza wartosc to NaN (brak poprzednika).
-    """
-    R = 6_371_000.0  # promien Ziemi [m]
-    lat1 = np.radians(lat[:-1])
-    lat2 = np.radians(lat[1:])
-    dlat = lat2 - lat1
-    dlon = np.radians(lon[1:] - lon[:-1])
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    d = 2 * R * np.arcsin(np.sqrt(a))
-    return np.concatenate([[np.nan], d])
-
-
-def _per_case_diffs(df: pd.DataFrame) -> dict:
-    """Liczy pochodne (z poprawnym groupby case_id) dla wszystkich kanalow."""
+def _per_case_diffs(df: pd.DataFrame) -> dict[str, pd.Series]:
     g = df.groupby("case_id", sort=False, group_keys=False)
     diffs = {
         "altitude": g["altitude"].diff(),
         "speed": g["speed"].diff(),
-        "heading": g["heading"].apply(_circular_diff),
+        "heading": g["heading"].apply(circular_diff),
     }
-    # GPS step liczymy per case
     gps_step = g.apply(
-        lambda x: pd.Series(_haversine_step(x["latitude"].values, x["longitude"].values),
-                             index=x.index)
+        lambda x: pd.Series(haversine_step(x["latitude"].values, x["longitude"].values), index=x.index)
     )
     diffs["gps_step"] = gps_step.droplevel(0) if isinstance(gps_step.index, pd.MultiIndex) else gps_step
     return diffs
-
-
-def _per_case_rolling(series: pd.Series, case_id: pd.Series, window: int, op: str):
-    """Rolling op (mean / std) wykonywany niezaleznie per case_id."""
-    g = series.groupby(case_id, sort=False, group_keys=False)
-    if op == "mean":
-        return g.transform(lambda s: s.rolling(window=window, min_periods=window // 2).mean())
-    if op == "std":
-        return g.transform(lambda s: s.rolling(window=window, min_periods=window // 2).std())
-    raise ValueError(op)
 
 
 def detect_sudden_changes(
@@ -96,12 +64,7 @@ def detect_sudden_changes(
         config = DEFAULT_CONFIG
 
     df = df.copy()
-    # Zabezpieczenie: kanaly numeryczne moga przyjsc jako object (string), jesli
-    # df nie przeszedl przez loader. Bez tego diff()/haversine wywala sie z
-    # "unsupported operand -: 'str' and 'str'".
-    for col in ("altitude", "speed", "heading", "latitude", "longitude"):
-        if col in df.columns and df[col].dtype == object:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = ensure_numeric_columns(df, ["altitude", "speed", "heading", "latitude", "longitude"])
 
     w = config["window"]
     th = config["z_threshold"]
@@ -110,40 +73,33 @@ def detect_sudden_changes(
     diffs = _per_case_diffs(df)
 
     z_scores = {}
-    for name, d in diffs.items():
-        rmean = _per_case_rolling(d, df["case_id"], w, "mean")
-        rstd = _per_case_rolling(d, df["case_id"], w, "std").clip(lower=min_std)
-        z = (d - rmean) / rstd
+    for name, diff in diffs.items():
+        rmean = rolling_by_case(diff, df["case_id"], w, "mean")
+        rstd = rolling_by_case(diff, df["case_id"], w, "std").clip(lower=min_std)
+        z = (diff - rmean) / rstd
         z_scores[name] = z
         df[f"z_{name}"] = z
 
-    df["alert_change"] = False
-    reasons_list = [[] for _ in range(len(df))]
-    for name, z in z_scores.items():
-        mask = (z.abs() > th).fillna(False).values
-        df["alert_change"] = df["alert_change"] | mask
-        for pos in range(len(df)):
-            if mask[pos]:
-                reasons_list[pos].append(f"sudden_{name}")
+    reason_df = pd.DataFrame(
+        {f"sudden_{name}": z.abs().gt(th).fillna(False) for name, z in z_scores.items()},
+        index=df.index,
+    )
 
-    # --- Detekcja freeze: nietypowo niska wariancja w krotkim oknie ---
     fw = config["freeze_window"]
-    speed_std = _per_case_rolling(df["speed"], df["case_id"], fw, "std")
-    heading_std = _per_case_rolling(df["heading"], df["case_id"], fw, "std")
-    gps_std = _per_case_rolling(diffs["gps_step"], df["case_id"], fw, "std")
+    speed_std = rolling_by_case(df["speed"], df["case_id"], fw, "std")
+    heading_std = rolling_by_case(df["heading"], df["case_id"], fw, "std")
+    gps_std = rolling_by_case(diffs["gps_step"], df["case_id"], fw, "std")
 
-    freeze_mask = (
+    reason_df["freeze_detected"] = (
         (speed_std < config["freeze_speed_std"])
         & (heading_std < config["freeze_heading_std"])
         & (gps_std < config["freeze_gps_std"])
-    ).fillna(False).values
+    ).fillna(False)
 
-    df["alert_change"] = df["alert_change"] | freeze_mask
-    for pos in range(len(df)):
-        if freeze_mask[pos]:
-            reasons_list[pos].append("freeze_detected")
-
-    df["change_reasons"] = ["|".join(r) if r else "" for r in reasons_list]
+    df["alert_change"] = reason_df.any(axis=1)
+    df["change_reasons"] = reason_df.apply(
+        lambda row: "|".join(row.index[row].tolist()), axis=1
+    )
     return df
 
 

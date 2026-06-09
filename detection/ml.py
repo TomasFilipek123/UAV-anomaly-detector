@@ -25,107 +25,11 @@ import warnings
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.metrics import precision_recall_curve
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.svm import OneClassSVM
 
-
-# --- Cechy okienkowe ------------------------------------------------------
-
-def _circular_diff(series: pd.Series) -> pd.Series:
-    raw = series.diff()
-    return ((raw + 180) % 360) - 180
-
-
-def _haversine_step(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
-    R = 6_371_000.0
-    lat1 = np.radians(lat[:-1])
-    lat2 = np.radians(lat[1:])
-    dlat = lat2 - lat1
-    dlon = np.radians(lon[1:] - lon[:-1])
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    d = 2 * R * np.arcsin(np.sqrt(a))
-    return np.concatenate([[np.nan], d])
-
-
-def _features_one_case(case_df: pd.DataFrame, window: int) -> pd.DataFrame:
-    """Liczy cechy okienkowe dla pojedynczego lotu (case_id)."""
-    feats = pd.DataFrame(index=case_df.index)
-    min_p = max(2, window // 2)
-
-    for col, prefix in [("altitude", "alt"), ("speed", "spd")]:
-        s = case_df[col]
-        roll = s.rolling(window=window, min_periods=min_p)
-        feats[f"{prefix}_mean"] = roll.mean()
-        feats[f"{prefix}_std"] = roll.std()
-        feats[f"{prefix}_range"] = roll.max() - roll.min()
-        feats[f"{prefix}_slope"] = (s - s.shift(window - 1)) / window
-
-    hdg_diff = _circular_diff(case_df["heading"])
-    feats["hdg_diff_mean"] = hdg_diff.rolling(window=window, min_periods=min_p).mean()
-    feats["hdg_diff_std"] = hdg_diff.rolling(window=window, min_periods=min_p).std()
-    feats["hdg_diff_abs_max"] = hdg_diff.abs().rolling(window=window, min_periods=min_p).max()
-
-    gps_step = pd.Series(
-        _haversine_step(case_df["latitude"].values, case_df["longitude"].values),
-        index=case_df.index,
-    )
-    feats["gps_step_mean"] = gps_step.rolling(window=window, min_periods=min_p).mean()
-    feats["gps_step_std"] = gps_step.rolling(window=window, min_periods=min_p).std()
-    feats["gps_step_max"] = gps_step.rolling(window=window, min_periods=min_p).max()
-
-    # Odstep czasowy miedzy probkami (sekundy).
-    # timestamp jest pd.Timestamp -> diff() to Timedelta, konwertujemy do sekund.
-    dt_raw = case_df["timestamp"].diff().dt.total_seconds()
-    dt = dt_raw.replace(0, np.nan)  # do gps_speed - unikamy dzielenia przez 0
-
-    # Roznica miedzy predkoscia sensora a predkoscia z GPS.
-    gps_speed = gps_step / dt
-    feats["speed_vs_gps"] = (case_df["speed"] - gps_speed).abs()
-    feats["speed_vs_gps"] = feats["speed_vs_gps"].rolling(window=window, min_periods=min_p).mean()
-
-    # Cechy z odstepow czasowych - celuja w tampery, ktore zaburzaja regularnosc
-    # probkowania, a nie ich wartosci fizyczne (recall ~0% bez tego):
-    #   deletion_gap -> duza luka czasowa (dt_max)
-    #   injection    -> zdublowany/wstrzyniety timestamp, dt ~ 0 (dt_min)
-    #   timestamp_drift -> nieregularne dt (dt_std)
-    # Uzywamy dt_raw (z zerami), bo dt==0 to wlasnie sygnal injection.
-    dt_roll = dt_raw.rolling(window=window, min_periods=min_p)
-    feats["dt_mean"] = dt_roll.mean()
-    feats["dt_std"] = dt_roll.std()
-    feats["dt_max"] = dt_roll.max()
-    feats["dt_min"] = dt_roll.min()
-
-    feats["sample_var_score"] = (
-        feats["alt_std"].fillna(0)
-        + feats["spd_std"].fillna(0)
-        + feats["hdg_diff_std"].fillna(0)
-        + feats["gps_step_std"].fillna(0)
-    )
-
-    return feats
-
-
-def compute_features(df: pd.DataFrame, window: int = 8) -> pd.DataFrame:
-    """
-    Liczy cechy okienkowe dla calego DataFrame, grupujac per case_id.
-    Wypelnia NaN-y (bfill + 0) na koncu - kazda probka ma kompletny wektor cech.
-    """
-    # Zabezpieczenie: kanaly numeryczne moga przyjsc jako object (string), jesli
-    # df nie przeszedl przez loader - wtedy diff()/haversine wywala sie z
-    # "unsupported operand -: 'str' and 'str'". Kopiujemy tylko gdy trzeba.
-    obj_cols = [c for c in ("altitude", "speed", "heading", "latitude", "longitude")
-                if c in df.columns and df[c].dtype == object]
-    if obj_cols:
-        df = df.copy()
-        for c in obj_cols:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    parts = []
-    for _, case_df in df.groupby("case_id", sort=False):
-        parts.append(_features_one_case(case_df, window))
-    feats = pd.concat(parts).sort_index()
-    feats = feats.bfill().fillna(0)
-    return feats
+from .features import compute_features
 
 
 # --- AnomalyDetector ------------------------------------------------------
@@ -173,6 +77,7 @@ class AnomalyDetector:
 
     model: object = field(default=None, init=False)
     threshold: float | None = field(default=None, init=False)
+    optimal_threshold: float | None = field(default=None, init=False)
     feature_names: list[str] = field(default_factory=list, init=False)
 
     def __post_init__(self):
@@ -221,13 +126,18 @@ class AnomalyDetector:
                 raise ImportError(
                     "Brak pakietu xgboost. Zainstaluj: pip install xgboost"
                 ) from e
+            # scale_pos_weight = liczba negatives / liczba positives
+            # Bedzie ustawiony w fit() gdy znamy rozkład danych
             return XGBClassifier(
-                n_estimators=self.params.get("n_estimators", 200),
-                max_depth=self.params.get("max_depth", 6),
-                learning_rate=self.params.get("learning_rate", 0.1),
+                n_estimators=self.params.get("n_estimators", 300),
+                max_depth=self.params.get("max_depth", 8),
+                learning_rate=self.params.get("learning_rate", 0.05),
+                subsample=self.params.get("subsample", 0.9),
+                colsample_bytree=self.params.get("colsample_bytree", 0.9),
                 eval_metric=self.params.get("eval_metric", "logloss"),
                 random_state=self.params.get("random_state", 42),
                 n_jobs=-1,
+                verbosity=0,
             )
         raise ValueError(self.algorithm)
 
@@ -267,7 +177,28 @@ class AnomalyDetector:
         else:
             y = df_train["label"].astype(int).values
             X_train, y_train = self._maybe_subsample_xy(X, y, rng)
+            
+            # Dla XGBoost: ustaw scale_pos_weight na podstawie rozkładu klas
+            if self.algorithm == "xgboost":
+                n_neg = (y_train == 0).sum()
+                n_pos = (y_train == 1).sum()
+                if n_pos > 0:
+                    scale_pos_weight = n_neg / n_pos
+                    self.model.set_params(scale_pos_weight=scale_pos_weight)
+            
             self.model.fit(X_train, y_train)
+            
+            # Dla supervised: oblicz optymalny próg na zbiorze treningowym
+            # na podstawie maksymalnego F1, aby nie przesadzić z false
+            # positives i nie zalewać wykresu alertami.
+            scores_train = self._raw_scores(X_train)
+            precision, recall, thresholds = precision_recall_curve(y_train, scores_train)
+            if len(thresholds) > 0:
+                f1_scores = 2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-12)
+                best_idx = int(np.nanargmax(f1_scores))
+                self.optimal_threshold = float(thresholds[best_idx])
+            else:
+                self.optimal_threshold = 0.5
 
         return self
 
@@ -326,7 +257,9 @@ class AnomalyDetector:
         if self.algorithm in UNSUPERVISED:
             alerts = scores < self.threshold
         else:
-            alerts = scores >= 0.5
+            # Dla supervised: użyj optymalnego progu (jeśli dostępny)
+            threshold = self.optimal_threshold if self.optimal_threshold is not None else 0.5
+            alerts = scores >= threshold
 
         result = df_test.copy()
         result["alert_ml"] = alerts
