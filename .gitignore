@@ -13,6 +13,7 @@ models/
 
 # Data artifacts
 data/*.csv
+data/drone_temparing_dataset_v2/
 data/*.png
 !data/.gitkeep
 
