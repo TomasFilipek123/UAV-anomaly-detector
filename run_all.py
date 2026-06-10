@@ -46,6 +46,18 @@ def parse_args() -> tuple[str, int, bool]:
     return args.algorithm, args.case, args.load
 
 
+def _choose_case_id(test_df, requested_case_id: int) -> int:
+    case_ids = set(test_df["case_id"].unique())
+    if requested_case_id in case_ids:
+        return requested_case_id
+    if not case_ids:
+        raise RuntimeError("Brak danych w zbiorze testowym. Nie można wygenerować wykresu.")
+    chosen = int(sorted(case_ids)[0])
+    print(f"UWAGA: case_id={requested_case_id} nie występuje w zestawie testowym.")
+    print(f"       Używam case_id={chosen} do wizualizacji.")
+    return chosen
+
+
 def run_pipeline(algorithm: str, case_id: int, load_model: bool = False) -> None:
     print("=" * 60)
     print("KROK 1: Wczytywanie datasetu")
@@ -124,6 +136,7 @@ def run_pipeline(algorithm: str, case_id: int, load_model: bool = False) -> None
     print("=" * 60)
     print("KROK 7: Wizualizacja przykladowego case'a")
     print("=" * 60)
+    case_id = _choose_case_id(test, case_id)
     png_path = PROJECT_ROOT / "data" / f"case_{case_id}_plot.png"
     plot_case(test, case_id, str(png_path))
 
