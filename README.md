@@ -46,10 +46,10 @@ python run_all.py xgboost          # supervised (wymaga xgboost)
 ```
 
 Wynik:
-- `data/confusion_matrices.png` - macierze pomylek per warstwa
-- `data/roc_curves.png` - ROC dla warstwy ML + punkty operacyjne W1/W2
-- `data/case_<id>_plot.png` - telemetria przykladowego lotu
-- `data/metrics_global.csv`, `metrics_per_scenario.csv`, `metrics_per_profile.csv`
+- `data/plots/confusion_matrices.png` - macierze pomylek per warstwa
+- `data/plots/roc_curves.png` - ROC dla warstwy ML + punkty operacyjne W1/W2
+- `data/plots/case_<id>_plot.png` - telemetria przykladowego lotu
+- `data/metrics/metrics_global.csv`, `metrics_per_scenario.csv`, `metrics_per_profile.csv`
 - `models/<algorithm>.pkl` - wytrenowany model
 
 ### Uruchamianie pojedynczych modulow
@@ -70,7 +70,7 @@ kolejka w pamieci (`queue.Queue`) + watki:
 
 | Modul | Rola |
 |---|---|
-| `streaming/generator.py` | `TelemetryGenerator` - odtwarza dataset probka po probce na kolejke, z zachowaniem tempa z `t_rel` (skroconego o `--speed`) |
+| `streaming/generator.py` | `TelemetryGenerator` - odtwarza dataset probka po probce na kolejke, z zachowaniem tempa z `t_rel` (skroconego o `--speed`); `make_synthetic_flights()` - generator gladkich lotow do demo (`--synthetic`) |
 | `streaming/consumer.py` | `StreamConsumer` - bufor krok-po-kroku per `case_id`, na kazdej probce odpala **wszystkie 3 warstwy** i emituje alert gdy ktorakolwiek zaalarmuje |
 | `streaming/alerts.py` | `Alert` + sinki: `ConsoleAlertSink`, `JsonlAlertSink`, `MultiSink` |
 | `streaming/run_stream.py` | punkt wejscia / demo - spina generator (watek) z konsumentem |
@@ -100,7 +100,7 @@ limitu), `--speed F` (przyspieszenie czasu, `1.0` = realny), `--replicate R`
 (domyslnie 3 = zbior testowy), `--layers` (`all` lub lista po przecinku z
 `{rules,statistical,ml}` - przez ktore warstwy przepuscic strumien),
 `--ml-threshold T` (prog decyzyjny warstwy ML), `--jsonl`
-(zapis alertow do `data/alerts.jsonl`).
+(zapis alertow do `data/alerts/alerts.jsonl`).
 
 > **Prog ML (`--ml-threshold`):** steruje czuloscia warstwy 3. Dla modeli supervised
 > (RF/XGBoost) `ml_score` to p(anomalia), a alert pada gdy `score >= prog`
@@ -124,6 +124,49 @@ najpierw `python run_all.py <algorithm>`. Na koncu drukowane jest podsumowanie
 > 1 MB). Metryki z malego `--max-samples` **nie sa reprezentatywne** (waski, gesty
 > w anomaliach wycinek) - po porownywalne z offline liczby uruchom bez limitu.
 
+### Tryb demonstracyjny - syntetyczne loty (`--synthetic`)
+
+Loty z datasetu sa dosc niestabilne, przez co warstwa 2 (rolling z-score) strzela
+juz na samym szumie - na wykresie robi sie gesto od alertow i ciezko cokolwiek
+pokazac. Flaga `--synthetic` zastepuje dataset **sztucznymi, gladkimi lotami**:
+plynna telemetria (niski szum) z **0-2 wyraznie odseparowanymi anomaliami** na lot.
+Dzieki temu wykresy (`--plot`) sa czytelne - widac dokladnie, ktora warstwa co
+wykryla. Loty maja te same kolumny co dataset (`label`/`tamper_type`/`t_rel`/...),
+wiec ida tym samym pipelinem co normalny strumien.
+
+```bash
+# 3 czyste loty przelotowe, alerty W1+W2, wykresy do data/plots/stream_case_<id>_plot.png
+python -m streaming.run_stream --synthetic --layers rules,statistical --plot
+
+# profil "mission" (start->przelot->ladowanie), 4 loty po 200 probek
+python -m streaming.run_stream --synthetic --syn-shape mission --cases 4 --syn-samples 200 --plot
+
+# konkretna pula anomalii i po 1 anomalii na lot
+python -m streaming.run_stream --synthetic --syn-anomalies altitude_spike,heading_inconsistency --syn-count 1 --plot
+```
+
+Parametry trybu syntetycznego:
+
+| Flaga | Znaczenie |
+|---|---|
+| `--syn-samples N` | liczba probek na lot (domyslnie 200) |
+| `--syn-anomalies a,b,...` | **pula** typow do losowania: `altitude_spike`, `speed_inconsistency`, `heading_inconsistency`, `coordinate_jump`; `none` = loty bez anomalii |
+| `--syn-count random\|N` | ile anomalii na lot - `random` (0-2 losowo, domyslnie) albo stala liczba |
+| `--syn-shape cruise\|mission` | profil lotu: `cruise` (przelot z falowaniem, najczystsze wykresy) albo `mission` (start->przelot->ladowanie) |
+| `--syn-static` | wylacza losowy ksztalt per lot (wspolny, powtarzalny baseline) |
+| `--syn-noise F` | mnoznik szumu pomiarowego (`0` = idealnie gladko) |
+
+W trybie `--synthetic` flagi `--max-samples` i `--replicate` sa ignorowane (loty
+sa juz w pelni okreslone). `--cases` steruje liczba generowanych lotow.
+
+> **Uwagi:** generowane sa tylko 4 powyzsze typy anomalii (skoki wartosci w jednym
+> kanale) - bez `timestamp_drift`/`deletion_gap`/`injection` (te dotycza czasu/liczby
+> probek). Przy `--syn-shape mission` rampa **ladowania** moze sama wzbudzic kilka
+> alertow W2 (nagla zmiana wysokosci) - to oczekiwane; `cruise` jest najczystszy.
+> Warstwa ML byla trenowana na realnym (zaszumionym) datasecie, wiec na gladkich
+> lotach bywa nadwrazliwa - do czystego demo uzyj `--layers rules,statistical`
+> albo podnies `--ml-threshold`.
+
 ## Trening na Google Colab
 
 Notebook `notebooks/train_colab.ipynb` trenuje wszystkie 5 algorytmow i zapisuje
@@ -137,7 +180,7 @@ pickle'e do `models/`. Po pobraniu na lokalna maszyne mozna ich uzyc przez
 
 ## Wyniki (replicate 3 = test, profile mieszane)
 
-Porownanie warstwy ML wg AUC (`data/roc_curves_all_algos.png`):
+Porownanie warstwy ML wg AUC (`data/plots/roc_curves_all_algos.png`):
 
 | Algorytm | AUC | rozmiar pkl |
 |---|---|---|

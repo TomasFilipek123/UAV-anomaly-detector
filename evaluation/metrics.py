@@ -222,7 +222,11 @@ def run_full_evaluation(
     if output_dir is None:
         output_dir = PROJECT_ROOT / "data"
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Artefakty trafiaja do podfolderow wg typu: wykresy -> plots/, tabele -> metrics/.
+    plots_dir = output_dir / "plots"
+    metrics_dir = output_dir / "metrics"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    metrics_dir.mkdir(parents=True, exist_ok=True)
 
     global_df, per_scen_df, per_profile_df = compute_full_evaluation(df, layers)
 
@@ -241,18 +245,18 @@ def run_full_evaluation(
     print("=" * 70)
     print(per_profile_df.to_string(index=False))
 
-    cm_path = output_dir / "confusion_matrices.png"
+    cm_path = plots_dir / "confusion_matrices.png"
     plot_confusion_matrices(df, layers, str(cm_path))
     plt.close()
 
     if score_columns:
-        roc_path = output_dir / "roc_curves.png"
+        roc_path = plots_dir / "roc_curves.png"
         plot_roc_curves(df, score_columns, layers, str(roc_path))
         plt.close()
 
-    global_df.to_csv(output_dir / "metrics_global.csv", index=False)
-    per_scen_df.to_csv(output_dir / "metrics_per_scenario.csv", index=False)
-    per_profile_df.to_csv(output_dir / "metrics_per_profile.csv", index=False)
-    print(f"\nZapisano tabele CSV w: {output_dir}")
+    global_df.to_csv(metrics_dir / "metrics_global.csv", index=False)
+    per_scen_df.to_csv(metrics_dir / "metrics_per_scenario.csv", index=False)
+    per_profile_df.to_csv(metrics_dir / "metrics_per_profile.csv", index=False)
+    print(f"\nZapisano tabele CSV w: {metrics_dir}")
 
     return global_df, per_scen_df, per_profile_df

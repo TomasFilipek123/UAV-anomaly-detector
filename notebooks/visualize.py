@@ -171,5 +171,7 @@ if __name__ == "__main__":
     df = load_dataset()
     case = pick_case_with_anomalies(df)
     print(f"Wybrany case_id: {case}")
-    png_path = PROJECT_ROOT / "data" / f"case_{case}_plot.png"
+    plots_dir = PROJECT_ROOT / "data" / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    png_path = plots_dir / f"case_{case}_plot.png"
     plot_case(df, case, str(png_path))

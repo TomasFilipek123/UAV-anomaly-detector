@@ -6,6 +6,11 @@ data/*.csv
 data/*.png
 !data/.gitkeep
 
+# Artefakty generowane przez pipeline (podfoldery wg typu)
+data/plots/
+data/metrics/
+data/alerts/
+
 models/
 .ipynb_checkpoints/
 
@@ -15,6 +20,3 @@ models/
 # Srodowiska i IDE
 .venv/
 .idea/
-
-# Alerty generowane przez streaming
-data/*.jsonl
