@@ -1,13 +1,39 @@
+# Python artifacts
 __pycache__/
-*.pyc
-*.pkl
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
+# Model / binary outputs
+*.pkl
+models/
+
+# Data artifacts
 data/*.csv
+data/drone_temparing_dataset_v2/
 data/*.png
 !data/.gitkeep
 
-models/
+# Notebook and editor
 .ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Local environment
+.env
+.env.*
+
+# Build / packaging
+*.egg-info/
+dist/
+build/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
 
 # Artefakty eksportu z Colab
 *.zip

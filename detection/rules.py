@@ -41,8 +41,6 @@ def detect_threshold_violations(
         thresholds = DEFAULT_THRESHOLDS
 
     df = df.copy()
-    n = len(df)
-    reasons = [[] for _ in range(n)]
 
     checks = [
         (df["altitude"] < thresholds["altitude_min"], "altitude_below_min"),
@@ -51,20 +49,21 @@ def detect_threshold_violations(
         (df["speed"] > thresholds["speed_max"],        "speed_above_max"),
         (df["heading"] < thresholds["heading_min"],    "heading_below_min"),
         (df["heading"] >= thresholds["heading_max"],   "heading_above_max"),
-        (df["latitude"] < thresholds["latitude_min"],  "latitude_out_of_range"),
-        (df["latitude"] > thresholds["latitude_max"],  "latitude_out_of_range"),
-        (df["longitude"] < thresholds["longitude_min"], "longitude_out_of_range"),
-        (df["longitude"] > thresholds["longitude_max"], "longitude_out_of_range"),
+        (df["latitude"] < thresholds["latitude_min"],  "latitude_below_min"),
+        (df["latitude"] > thresholds["latitude_max"],  "latitude_above_max"),
+        (df["longitude"] < thresholds["longitude_min"], "longitude_below_min"),
+        (df["longitude"] > thresholds["longitude_max"], "longitude_above_max"),
     ]
 
-    for mask, label in checks:
-        mask = mask.fillna(False).values
-        for pos in range(n):
-            if mask[pos]:
-                reasons[pos].append(label)
+    reason_df = pd.DataFrame(
+        {label: mask.fillna(False) for mask, label in checks},
+        index=df.index,
+    )
 
-    df["alert_threshold"] = [len(r) > 0 for r in reasons]
-    df["alert_reasons"] = ["|".join(r) if r else "" for r in reasons]
+    df["alert_threshold"] = reason_df.any(axis=1)
+    df["alert_reasons"] = reason_df.apply(
+        lambda row: "|".join(row.index[row].tolist()), axis=1
+    )
     return df
 
 
