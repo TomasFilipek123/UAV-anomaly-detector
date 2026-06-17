@@ -7,27 +7,58 @@ Pelny pipeline na rzeczywistym datasecie Kaggle:
   5. Wizualizacja jednego wybranego case_id
 
 Uruchom z katalogu projektu:
-    python run_all.py [algorithm]
+    python run_all.py [--algorithm ALGO] [--case CASE]
 
 Domyslny algorytm warstwy 3 to isolation_forest. Inne opcje:
     one_class_svm, lof, random_forest, xgboost
 """
 
+from argparse import ArgumentParser
 from pathlib import Path
-import sys
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.loader import load_dataset, split_by_replicate, summarize
 from detection.rules import detect_threshold_violations
 from detection.statistical import detect_sudden_changes
 from detection.ml import AnomalyDetector, compute_features
-from evaluation.metrics import run_full_evaluation
-from notebooks.visualize import plot_case, pick_case_with_anomalies
+from evaluation.report import run_full_evaluation
+from notebooks.visualize import plot_case
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+SUPPORTED_ALGORITHMS = [
+    "isolation_forest",
+    "one_class_svm",
+    "lof",
+    "random_forest",
+    "xgboost",
+]
 
 
-def main(algorithm: str = "isolation_forest") -> None:
+def parse_args() -> tuple[str, int, bool]:
+    parser = ArgumentParser(description="Uruchom pipeline detekcji anomalii drona.")
+    parser.add_argument("--algorithm", "-a", default="isolation_forest",
+                        choices=SUPPORTED_ALGORITHMS,
+                        help="Algorytm ML dla warstwy 3.")
+    parser.add_argument("--case", "-c", type=int, default=550,
+                        help="case_id do wizualizacji.")
+    parser.add_argument("--load", "-l", action="store_true",
+                        help="Wczytaj gotowy model zamiast trenować na nowo.")
+    args = parser.parse_args()
+    return args.algorithm, args.case, args.load
+
+
+def _choose_case_id(test_df, requested_case_id: int) -> int:
+    case_ids = set(test_df["case_id"].unique())
+    if requested_case_id in case_ids:
+        return requested_case_id
+    if not case_ids:
+        raise RuntimeError("Brak danych w zbiorze testowym. Nie można wygenerować wykresu.")
+    chosen = int(sorted(case_ids)[0])
+    print(f"UWAGA: case_id={requested_case_id} nie występuje w zestawie testowym.")
+    print(f"       Używam case_id={chosen} do wizualizacji.")
+    return chosen
+
+
+def run_pipeline(algorithm: str, case_id: int, load_model: bool = False) -> None:
     print("=" * 60)
     print("KROK 1: Wczytywanie datasetu")
     print("=" * 60)
@@ -61,21 +92,35 @@ def main(algorithm: str = "isolation_forest") -> None:
     print("=" * 60)
     print(f"KROK 5: Warstwa 3 - ML ({algorithm})")
     print("=" * 60)
-    # Cechy okienkowe liczymy raz dla train i raz dla test (gdyby trenowac
-    # wiele algorytmow z rzedu - cache zaoszczedzilby kilka minut na pelnym datasecie).
-    print("Liczenie cech okienkowych (train)...")
-    train_features = compute_features(train, window=8)
-    print("Liczenie cech okienkowych (test)...")
-    test_features = compute_features(test, window=8)
+    
+    models_dir = PROJECT_ROOT / "models"
+    model_path = models_dir / f"{algorithm}.pkl"
+    
+    if load_model and model_path.exists():
+        print(f"Wczytywanie gotowego modelu: {model_path}")
+        detector = AnomalyDetector.load(model_path)
+        print("Model załadowany pomyślnie.")
+        print("Liczenie cech okienkowych (test)...")
+        test_features = compute_features(test, window=8)
+    else:
+        if load_model:
+            print(f"Model nie znaleziony: {model_path}")
+            print("Będę trenować model na nowo...")
+        # Cechy okienkowe liczymy raz dla train i raz dla test (gdyby trenowac
+        # wiele algorytmow z rzedu - cache zaoszczedzilby kilka minut na pelnym datasecie).
+        print("Liczenie cech okienkowych (train)...")
+        train_features = compute_features(train, window=8)
+        print("Liczenie cech okienkowych (test)...")
+        test_features = compute_features(test, window=8)
 
-    detector = AnomalyDetector(algorithm=algorithm).fit(train, features=train_features)
+        detector = AnomalyDetector(algorithm=algorithm).fit(train, features=train_features)
+        # Zapis modelu
+        models_dir.mkdir(parents=True, exist_ok=True)
+        detector.save(model_path)
+        print(f"Zapisano model: {model_path}")
+    
     test = detector.predict(test, features=test_features)
     print(f"Alerty W3: {test['alert_ml'].sum():,}/{len(test):,}")
-
-    # Zapis modelu
-    models_dir = PROJECT_ROOT / "models"
-    detector.save(models_dir / f"{algorithm}.pkl")
-    print(f"Zapisano model: {models_dir / f'{algorithm}.pkl'}")
 
     print()
     print("=" * 60)
@@ -97,6 +142,10 @@ def main(algorithm: str = "isolation_forest") -> None:
     plots_dir.mkdir(parents=True, exist_ok=True)
     png_path = plots_dir / f"case_{case}_plot.png"
     plot_case(test, case, str(png_path))
+    case_id = _choose_case_id(test, case_id)
+    png_path = PROJECT_ROOT / "data" / f"case_{case_id}_plot.png"
+    plot_case(test, case_id, str(png_path))
+ 
 
     print()
     print("=" * 60)
@@ -107,6 +156,10 @@ def main(algorithm: str = "isolation_forest") -> None:
     print(f"Model w:    {models_dir / f'{algorithm}.pkl'}")
 
 
+def main() -> None:
+    algorithm, case_id, load_model = parse_args()
+    run_pipeline(algorithm, case_id, load_model)
+
+
 if __name__ == "__main__":
-    algo = sys.argv[1] if len(sys.argv) > 1 else "isolation_forest"
-    main(algo)
+    main()

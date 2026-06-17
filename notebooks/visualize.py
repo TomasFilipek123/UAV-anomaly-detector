@@ -23,8 +23,17 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _anomaly_segments(case_df: pd.DataFrame) -> list[tuple[float, float, str]]:
-    """Zwraca ciagle segmenty (t_start, t_end, tamper_type)."""
+def _anomaly_segments(
+    case_df: pd.DataFrame,
+    merge_gap: float = 0.2,
+    min_duration: float = 0.15,
+) -> list[tuple[float, float, str]]:
+    """Zwraca ciagle segmenty (t_start, t_end, tamper_type).
+
+    Scalmy krótkie przerwy i filtrujemy bardzo krótkie segmenty,
+    aby wykres nie był przesadnie zagęszczony dla przypadków
+    z wieloma szybkim przełączeniami label/normal.
+    """
     segs = []
     in_seg = False
     seg_start = None
@@ -44,7 +53,59 @@ def _anomaly_segments(case_df: pd.DataFrame) -> list[tuple[float, float, str]]:
                 in_seg = False
     if in_seg:
         segs.append((seg_start, case_df["t_rel"].iloc[-1], seg_type))
-    return segs
+
+    merged = []
+    for start, end, typ in segs:
+        if not merged:
+            merged.append((start, end, typ))
+            continue
+        prev_start, prev_end, prev_typ = merged[-1]
+        gap = start - prev_end
+        if typ == prev_typ and gap <= merge_gap:
+            merged[-1] = (prev_start, end, prev_typ)
+        else:
+            merged.append((start, end, typ))
+
+    filtered = []
+    for start, end, typ in merged:
+        if end - start >= min_duration:
+            filtered.append((start, end, typ))
+    return filtered
+
+
+def _binary_segments(
+    case_df: pd.DataFrame,
+    bool_col: str,
+    merge_gap: float = 0.2,
+    min_duration: float = 0.15,
+) -> list[tuple[float, float]]:
+    """Zwraca zgrupowane segmenty dla boolowskiej kolumny alertów."""
+    segs = []
+    in_seg = False
+    seg_start = None
+    for _, row in case_df.iterrows():
+        if row[bool_col] and not in_seg:
+            seg_start = row["t_rel"]
+            in_seg = True
+        elif not row[bool_col] and in_seg:
+            segs.append((seg_start, row["t_rel"]))
+            in_seg = False
+    if in_seg:
+        segs.append((seg_start, case_df["t_rel"].iloc[-1]))
+
+    merged = []
+    for start, end in segs:
+        if not merged:
+            merged.append((start, end))
+            continue
+        prev_start, prev_end = merged[-1]
+        gap = start - prev_end
+        if gap <= merge_gap:
+            merged[-1] = (prev_start, end)
+        else:
+            merged.append((start, end))
+
+    return [(start, end) for start, end in merged if end - start >= min_duration]
 
 
 def plot_case(
@@ -88,6 +149,8 @@ def plot_case(
 
     has = {col: col in case_df.columns for col in ["alert_threshold", "alert_change", "alert_ml"]}
 
+    ml_segs = _binary_segments(case_df, "alert_ml") if has["alert_ml"] else []
+
     for ax, col, label, color in panels:
         ax.plot(case_df["t_rel"], case_df[col], color=color, linewidth=1.0)
         for start, end, atype in segs:
@@ -100,13 +163,16 @@ def plot_case(
         for alert_col, c, marker, s in [
             ("alert_threshold", "orange", "o", 15),
             ("alert_change",    "blue",   "x", 30),
-            ("alert_ml",        "green",  "^", 40),
         ]:
             if has[alert_col]:
                 sub = case_df[case_df[alert_col]]
                 if len(sub) > 0:
                     ax.scatter(sub["t_rel"], sub[col], color=c, s=s, zorder=5, marker=marker,
                                alpha=0.7, linewidths=0.5)
+
+        if ml_segs:
+            for start, end in ml_segs:
+                ax.axvspan(start, end, alpha=0.12, color="limegreen")
         ax.set_ylabel(label)
         ax.grid(True, alpha=0.3)
 

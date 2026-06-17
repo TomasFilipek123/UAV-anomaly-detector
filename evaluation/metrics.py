@@ -1,32 +1,16 @@
-"""
-Modul ewaluacji - precision, recall, F1, confusion matrix, ROC.
+﻿"""
+Modul ewaluacji - precision, recall, F1, confusion matrix.
 
 Funkcje:
-  - compute_layer_metrics(df, alert_col)      -> metryki dla jednej warstwy
-  - compute_full_evaluation(df)                -> tabele: global / per scenariusz / per profile
-  - plot_confusion_matrices(df, layers)        -> macierze pomylek obok siebie
-  - plot_roc_curves(df, score_columns)         -> krzywe ROC dla algorytmow ML
-  - run_full_evaluation(df, ...)               -> kompletny raport + zapis wykresow
+  - compute_layer_metrics(df, alert_col) -> metryki dla jednej warstwy
+  - compute_full_evaluation(df)         -> tabele: global / per scenariusz / per profile
 """
 
-from pathlib import Path
-
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-from sklearn.metrics import (
-    confusion_matrix,
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_curve,
-    roc_auc_score,
-)
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 
 
-# Domyslna mapa warstw - mozna nadpisac w run_full_evaluation
+# Domyslna mapa warstw - mozna nadpisac w report.py
 DEFAULT_LAYERS = {
     "alert_threshold": "Warstwa 1 (progi)",
     "alert_change":    "Warstwa 2 (statystyki)",
@@ -61,7 +45,6 @@ def compute_full_evaluation(
     if layers is None:
         layers = DEFAULT_LAYERS
 
-    # 1. Globalne
     rows = []
     for col, name in layers.items():
         m = compute_layer_metrics(df, col)
@@ -74,19 +57,17 @@ def compute_full_evaluation(
         })
     global_df = pd.DataFrame(rows)
 
-    # 2. Per tamper_type (recall - bo precision per scenariusz nie ma sensu)
     rows = []
     scenarios = sorted(t for t in df["tamper_type"].unique() if t != "normal")
     for atype in scenarios:
         sub = df[df["tamper_type"] == atype]
         row = {"tamper_type": atype, "probek": len(sub)}
         for col, name in layers.items():
-            d = sub[col].sum()
+            d = int(sub[col].sum())
             row[name] = f"{d}/{len(sub)} ({100*d/len(sub):.0f}%)"
         rows.append(row)
     per_scen_df = pd.DataFrame(rows)
 
-    # 3. Per profile (subtle / balanced / strong) - tylko dla anomalii
     rows = []
     for profile in ["subtle", "balanced", "strong"]:
         sub = df[(df["profile"] == profile) & (df["label"] == 1)]
@@ -94,7 +75,7 @@ def compute_full_evaluation(
             continue
         row = {"profile": profile, "probek": len(sub)}
         for col, name in layers.items():
-            d = sub[col].sum()
+            d = int(sub[col].sum())
             row[name] = f"{d}/{len(sub)} ({100*d/len(sub):.0f}%)"
         rows.append(row)
     per_profile_df = pd.DataFrame(rows)
