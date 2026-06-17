@@ -80,6 +80,7 @@ def run_pipeline(algorithm: str, case_id: int, load_model: bool = False) -> None
     test = detect_threshold_violations(test)
     print(f"Alerty W1: {test['alert_threshold'].sum():,}/{len(test):,}")
 
+
     print()
     print("=" * 60)
     print("KROK 4: Warstwa 2 - statystyki kroczace")
@@ -136,16 +137,23 @@ def run_pipeline(algorithm: str, case_id: int, load_model: bool = False) -> None
     print("=" * 60)
     print("KROK 7: Wizualizacja przykladowego case'a")
     print("=" * 60)
+    case = pick_case_with_anomalies(test)
+    plots_dir = PROJECT_ROOT / "data" / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    png_path = plots_dir / f"case_{case}_plot.png"
+    plot_case(test, case, str(png_path))
     case_id = _choose_case_id(test, case_id)
     png_path = PROJECT_ROOT / "data" / f"case_{case_id}_plot.png"
     plot_case(test, case_id, str(png_path))
+ 
 
     print()
     print("=" * 60)
     print("GOTOWE")
     print("=" * 60)
-    print(f"Wykresy + tabele w: {PROJECT_ROOT / 'data'}")
-    print(f"Model w:            {models_dir / f'{algorithm}.pkl'}")
+    print(f"Wykresy w:  {plots_dir}")
+    print(f"Tabele w:   {PROJECT_ROOT / 'data' / 'metrics'}")
+    print(f"Model w:    {models_dir / f'{algorithm}.pkl'}")
 
 
 def main() -> None:

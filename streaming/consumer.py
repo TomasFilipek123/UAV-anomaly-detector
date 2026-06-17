@@ -55,6 +55,11 @@ class StreamConsumer:
         p(anomalia); unsupervised: prog wyuczony z percentyla). Podanie wartosci
         nadpisuje decyzje: supervised -> alert gdy score >= prog; unsupervised ->
         alert gdy score < prog.
+    collect_rows : bool, optional
+        Gdy True, kazda przetworzona probka jest zapamietywana wraz z flagami
+        alertow per warstwa (alert_threshold/alert_change/alert_ml). Pozwala na
+        koncu zbudowac DataFrame (to_dataframe) i narysowac wykres tym samym
+        plot_case co tryb wsadowy. Domyslnie False (oszczedza pamiec).
     """
 
     def __init__(
@@ -66,12 +71,16 @@ class StreamConsumer:
         stat_config: dict | None = None,
         enabled_layers: "Iterable[str] | None" = None,
         ml_threshold: float | None = None,
+        collect_rows: bool = False,
     ):
         self.detector = detector
         self.in_queue = in_queue
         self.sink = sink
         self.stat_config = stat_config or DEFAULT_CONFIG
         self.ml_threshold = ml_threshold
+
+        # Bufor wszystkich probek do wizualizacji (None = nie zbieramy).
+        self.records: list[dict] | None = [] if collect_rows else None
 
         # Walidacja i ustalenie aktywnych warstw (zachowujemy kanoniczna kolejnosc).
         if enabled_layers is None:
@@ -161,6 +170,15 @@ class StreamConsumer:
         label = row.get("label")
         label = int(label) if label is not None and pd.notna(label) else None
 
+        # Zapamietanie probki do wizualizacji: oryginalne pola + flagi alertow
+        # per warstwa (te same nazwy kolumn, ktorych oczekuje plot_case).
+        if self.records is not None:
+            rec = dict(row)
+            rec["alert_threshold"] = "rules" in layers
+            rec["alert_change"] = "statistical" in layers
+            rec["alert_ml"] = "ml" in layers
+            self.records.append(rec)
+
         # Ewaluacja online.
         self.n_samples += 1
         if combined:
@@ -194,6 +212,16 @@ class StreamConsumer:
             if row is END_OF_STREAM:
                 break
             self._process(row)
+
+    def to_dataframe(self) -> pd.DataFrame:
+        """
+        Zwraca DataFrame ze wszystkich przetworzonych probek (gdy collect_rows=True).
+        Zawiera oryginalne kolumny telemetrii + flagi alert_threshold/alert_change/
+        alert_ml, czyli dokladnie to, czego potrzebuje plot_case.
+        """
+        if self.records is None:
+            raise RuntimeError("Wlacz collect_rows=True, aby zbierac probki do wizualizacji.")
+        return pd.DataFrame(self.records)
 
     def summary(self) -> dict:
         """Zwraca liczniki + precision/recall/F1 dla alertow strumieniowych."""

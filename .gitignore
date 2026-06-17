@@ -17,7 +17,13 @@ data/drone_temparing_dataset_v2/
 data/*.png
 !data/.gitkeep
 
-# Notebook and editor
+# Artefakty generowane przez pipeline (podfoldery wg typu)
+data/plots/
+data/metrics/
+data/alerts/
+
+models/
+
 .ipynb_checkpoints/
 .vscode/
 .idea/
@@ -41,6 +47,3 @@ Thumbs.db
 # Srodowiska i IDE
 .venv/
 .idea/
-
-# Alerty generowane przez streaming
-data/*.jsonl
